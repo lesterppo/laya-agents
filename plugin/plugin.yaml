@@ -1,0 +1,14 @@
+name: hermes_laya
+description: >-
+  Native Hermes tool for Laya, a multilingual non-autoregressive System 1
+  decision engine: typed decisions (choice/score/noul) over text or JSON in a
+  single forward pass, ~140ms warm on CPU, no API key and no quota. Actions:
+  decide (custom typed questions), route (checkpoint pick, no model load),
+  and the triage / guard / moderation / routemodel / email presets, plus status.
+  Registers toolset laya.
+author: Peter (lesterppo)
+version: 1.0.0
+license: MIT
+kind: standalone
+tags: [laya, decisions, classification, system-one, guardrails, triage, moderation, routing, non-autoregressive, llm-pre-filter, token-efficiency, local-inference, multilingual, native-tool]
+homepage: https://github.com/lesterppo/hermes-laya
