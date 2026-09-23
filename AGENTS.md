@@ -1,4 +1,4 @@
-# hermes-laya — agent guide
+# laya-agents — agent guide
 
 Native Hermes tool wrapping [Laya](https://github.com/NandhaKishorM/laya), a
 multilingual non-autoregressive System 1 decision engine. Decisions

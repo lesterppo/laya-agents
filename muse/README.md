@@ -51,7 +51,7 @@ A failing line returns `{"ok":false,"e":"..."}` without killing the batch.
 
 ```python
 import sys
-sys.path.insert(0, "/path/to/hermes-laya/muse")
+sys.path.insert(0, "/path/to/laya-agents/muse")
 import laya_muse as lm
 
 d = lm.predict("triage", state="You charged me twice, refund NOW or I cancel everything")

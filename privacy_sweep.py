@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pre-push privacy sweep for hermes-laya.
+"""Pre-push privacy sweep for laya-agents.
 
 Fails (exit 1) if the tracked files contain home paths, personal emails,
 account handles, tokens, or private key material. Run before every push:

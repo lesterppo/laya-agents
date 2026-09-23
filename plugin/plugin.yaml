@@ -11,4 +11,4 @@ version: 1.0.0
 license: MIT
 kind: standalone
 tags: [laya, decisions, classification, system-one, guardrails, triage, moderation, routing, non-autoregressive, llm-pre-filter, token-efficiency, local-inference, multilingual, native-tool]
-homepage: https://github.com/lesterppo/hermes-laya
+homepage: https://github.com/lesterppo/laya-agents

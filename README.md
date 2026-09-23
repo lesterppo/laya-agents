@@ -1,4 +1,4 @@
-# hermes-laya — Laya System 1 decision engine for Hermes Agent and Muse
+# laya-agents — Laya System 1 decision engine for Hermes Agent and Muse
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
@@ -70,8 +70,8 @@ Native plugin in `plugin/`. Install:
 
 ```bash
 pip install laya                 # needs Python >= 3.10, torch, transformers
-git clone https://github.com/lesterppo/hermes-laya
-cd hermes-laya && ./install.sh
+git clone https://github.com/lesterppo/laya-agents
+cd laya-agents && ./install.sh
 ```
 
 `install.sh` copies the plugin into `~/.hermes/plugins/hermes_laya/` (outside the
@@ -122,7 +122,7 @@ cat tickets.jsonl | muse/bin/laya --batch -
 
 ```python
 import sys
-sys.path.insert(0, "/path/to/hermes-laya/muse")
+sys.path.insert(0, "/path/to/laya-agents/muse")
 import laya_muse as lm
 
 d = lm.predict("triage", state="You charged me twice, refund NOW or I cancel everything")
@@ -174,7 +174,7 @@ Measured behavior that makes the gate safe:
 
 ## FAQ
 
-**What is hermes-laya?**
+**What is laya-agents?**
 A native integration of the Laya System 1 decision engine for AI agents. It
 answers typed questions about text — classify this, is it a jailbreak, how
 urgent is it — in one neural forward pass, locally, with calibrated
