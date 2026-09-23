@@ -88,6 +88,12 @@ def _validate_questions(qs: dict) -> tuple[bool, str]:
                     f"choice question '{qid}' has {len(crit)} options "
                     f"(> {_MAX_OPTS}); split or shortlist first"
                 )
+        elif q["type"] == "score":
+            if not isinstance(crit, list) or not crit:
+                return False, (
+                    f"score question '{qid}' needs criteria as a non-empty list of "
+                    "level descriptions (index 0 = lowest)"
+                )
     return True, ""
 
 
