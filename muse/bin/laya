@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Muse CLI for laya decisions.
+
+Single call:
+    laya --action guard --state "..."
+    laya --action decide --state "..." --questions '{...}'
+    laya --action route --state "我被重複收了兩次費用"
+    laya --action status
+
+Batch (one warm process for many requests — avoids the checkpoint reload
+that a fresh process per call would pay):
+    laya --batch requests.jsonl
+    cat requests.jsonl | laya --batch -
+
+Each JSONL line: {"action": "...", "state": "...", "questions": {...}, ...}
+One JSON object per line on stdout, in order.
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from laya_muse import main  # noqa: E402
+
+raise SystemExit(main())
