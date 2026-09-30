@@ -45,6 +45,20 @@ _sanitize_proxy_env()
 # Plain-HTTP resume for checkpoint downloads when hf-xet stalls behind a proxy.
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
+# SHA-256 pins for the upstream checkpoint weights, verified by laya >= 0.3.22
+# before any weight file is parsed or executed (fail-closed: a tampered or
+# silently-updated checkpoint raises instead of loading). Digests computed from
+# convaiinnovations/laya @ 55cf4c4e (2026-09-30; files identical to the
+# aa8c91ca snapshot). typed-decisions ships from a separate repo
+# (convaiinnovations/laya-typed-decisions) and is left unpinned here — it is
+# never auto-loaded. To re-pin after an upstream weight update: sha256sum the
+# new model.safetensors files and replace the values below.
+_CHECKPOINT_DIGESTS = {
+    "english": {"model.safetensors": "891102d372688fc2a094dac56a384bc537b87c63f21f9f3dac0be2b7cbc8d86c"},
+    "multilingual": {"model.safetensors": "9d628fd971b700382ac6f65920a86f149777b2e748e0c955fb3b19695aa8f204"},
+}
+os.environ.setdefault("LAYA_SHA256_DIGESTS", json.dumps(_CHECKPOINT_DIGESTS))
+
 _QTYPES = ("choice", "score", "noul")
 _MODELS = ("auto", "english", "multilingual", "typed-decisions")
 _PRESETS = ("triage", "guard", "moderation", "routemodel", "email")

@@ -25,6 +25,15 @@ pip install laya          # needs Python >= 3.10, plus torch and transformers
 No install step for the module itself — put this directory somewhere stable
 and call it by path.
 
+## Checkpoint integrity
+
+On laya ≥ 0.3.22 the module pins SHA-256 digests of the upstream checkpoint
+weights (`convaiinnovations/laya`, english + multilingual) via
+`LAYA_SHA256_DIGESTS`. A tampered or silently-updated weight file fails
+closed at load time, before any weight is parsed. A user-provided
+`LAYA_SHA256_DIGESTS` always wins; refresh the pinned values with
+`sha256sum` on the new `model.safetensors` files after an upstream release.
+
 ## CLI
 
 ```bash

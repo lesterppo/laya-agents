@@ -26,6 +26,29 @@ _MAX_Q = 20
 _MAX_OPTS = 50
 _INLINE_CAP = 6000
 
+# SHA-256 pins for the upstream checkpoint weights, verified by laya >= 0.3.22
+# before any weight file is parsed or executed (fail-closed: a tampered or
+# silently-updated checkpoint raises instead of loading). Digests computed from
+# convaiinnovations/laya @ 55cf4c4e (2026-09-30). typed-decisions ships from a
+# separate repo and is left unpinned — it is never auto-loaded. setdefault so a
+# user-provided LAYA_SHA256_DIGESTS always wins.
+import json as _json
+import os as _os
+
+_os.environ.setdefault(
+    "LAYA_SHA256_DIGESTS",
+    _json.dumps(
+        {
+            "english": {
+                "model.safetensors": "891102d372688fc2a094dac56a384bc537b87c63f21f9f3dac0be2b7cbc8d86c"
+            },
+            "multilingual": {
+                "model.safetensors": "9d628fd971b700382ac6f65920a86f149777b2e748e0c955fb3b19695aa8f204"
+            },
+        }
+    ),
+)
+
 _ROUTER = None
 
 
