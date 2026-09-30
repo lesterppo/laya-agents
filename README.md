@@ -238,6 +238,7 @@ muse/bin/laya              # thin CLI wrapper over the module
 muse/README.md             # Muse integration usage
 skills/laya-decisions/     # Hermes skill: actions, measurements, usage rules
 tests/test_laya_tool.py    # offline validation battery (no model download needed)
+tests/test_privacy_sweep.py # scanner regression: redaction + tracked-files-only
 install.sh                 # plugin + skill installer (Hermes)
 privacy_sweep.py           # pre-push identifier scan
 ```
