@@ -1,7 +1,7 @@
 ---
 name: laya-decisions
 description: Use for fast typed text decisions without an LLM call.
-version: 2.0.0
+version: 2.1.0
 author: Peter (lesterppo)
 license: MIT
 metadata:
@@ -81,8 +81,10 @@ Pass `min_confidence` and each answer reports `abstention`:
   0.000 at 0.95 confidence on Khmer. Never rely on confidence to catch a
   wrong-checkpoint call — route BEFORE the forward pass (`auto` does this).
   German also routes to multilingual (Latin script, but not English).
-- `long` caps the state at 40 000 chars: wide window sets on a small box
-  exhaust RAM and the process gets OOM-killed.
+- `long` caps the state at 40 000 chars and chunks windows 8 per forward
+  pass: wide window sets in a single pass (the upstream default) exhaust
+  RAM on a small box and the process gets OOM-killed (exit 137). `batch`
+  chunks states the same way, 8 per pass, each state ≤ 8 000 chars.
 - `typed-decisions` checkpoint is fine-tune-specific; base checkpoints are
   near-chance on its workflows zero-shot. Do not use unless fine-tuned.
 - Shipped temperatures warning ("outside [0.5, 5]... clamping") is benign;
@@ -101,6 +103,7 @@ to `sys.path`. If `import laya` fails, run that script and restart the gateway.
 ## Tests
 
 ```bash
-python tests/test_laya_tool.py   # offline: 65 cases, no model needed
+python tests/test_laya_tool.py   # offline: 73 cases, no model needed
+python tests/test_laya_muse.py   # offline: 73 cases (Muse module), no model needed
 python tests/test_laya_live.py   # live: real model, every action
 ```
