@@ -241,6 +241,46 @@ if not QUICK:
           d.get("a", {}).get("refund"))
     TIMES["long"] = d.get("_ms", 0)
 
+    # Multilingual long scan: CJK text tokenises ~1 token/char, so a modest
+    # document already makes many wide (max_len 1024) windows — the shape
+    # that OOM-killed a small box when every window ran in one forward pass.
+    # The tool now chunks windows (batch_size=_FORWARD_BATCH); this case is
+    # the regression guard.
+    seg = "這份報告包含日常營運記錄與排班說明，沒有特別事件。"
+    doc_ml = (seg * 300) + "\n重要：客戶被重複收費，要求立即退款。\n" + (seg * 50)
+    d = call({"action": "long", "state": doc_ml,
+              "questions": q({"refund": {"type": "noul",
+                                         "instructions": "Does the text request a refund?"}})})
+    print(json.dumps(d, ensure_ascii=False)[:900])
+    check("long-ml ok", d.get("ok") is True, d.get("e"))
+    check("long-ml routed to multilingual", d.get("r", {}).get("m") == "multilingual",
+          d.get("r"))
+    check("long-ml scanned multiple windows", (d.get("win") or 0) > 1, d.get("win"))
+    check("long-ml found the refund request",
+          float(d.get("a", {}).get("refund", {}).get("noul", 0)) > 0.5,
+          d.get("a", {}).get("refund"))
+    TIMES["long-ml"] = d.get("_ms", 0)
+
+# ---------------------------------------------------------------------------
+print("\n== batch (wide, chunked) ==")
+states16 = ([f"Please refund invoice {i}, you charged me twice" for i in range(6)]
+            + [f"The server is down, error {i}" for i in range(5)]
+            + [f"Can I get a demo, item {i}?" for i in range(5)])
+d = call({"action": "batch", "states": q(states16),
+          "questions": q({"intent": {
+              "type": "choice",
+              "instructions": "What does the customer want in `message`?",
+              "criteria": {"refund": "money back", "technical": "bug or outage",
+                           "sales": "pricing or demo", "other": "none"}}})})
+print(json.dumps(d, ensure_ascii=False)[:600])
+check("batch-16 ok", d.get("ok") is True, d.get("e"))
+check("batch-16 returned every state", d.get("n") == 16, d.get("n"))
+b16 = d.get("batch") or []
+check("batch-16 first is refund",
+      len(b16) == 16 and b16[0]["a"]["intent"]["choice"] == "refund",
+      b16[0]["a"]["intent"] if b16 else None)
+TIMES["batch-16"] = d.get("_ms", 0)
+
 # ---------------------------------------------------------------------------
 print("\n== tournament (narrowing a wide choice) ==")
 if not QUICK:
