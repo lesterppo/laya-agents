@@ -206,6 +206,68 @@ try:
 except ImportError:
     check("presets resolve (laya installed)", False, "laya not importable — skipped")
 
+# --- memory bounds: batch/long chunking (OOM regression) --------------------
+# Upstream predict_batch / predict_long default to ONE forward pass over
+# every state/window, so peak RAM grows with the item count and OOM-kills
+# small boxes. The tool must always pass batch_size=_FORWARD_BATCH, and
+# batch states are capped per state like a single state is.
+d = call({"action": "batch", "states": _q(["x" * 9000]), "questions": _q({"x": NOUL})})
+check("batch rejects per-state >8000 chars", d.get("ok") is False, d.get("e"))
+
+check("_sanitize_proxy_env is installed", callable(t._sanitize_proxy_env))
+import os as _os
+
+_old_np = _os.environ.get("NO_PROXY")
+_os.environ["NO_PROXY"] = "localhost,[::1]"
+t._sanitize_proxy_env()
+check("proxy sanitize replaces bracketed IPv6 no_proxy",
+      _os.environ["NO_PROXY"] == "localhost,127.0.0.1", _os.environ["NO_PROXY"])
+_os.environ["NO_PROXY"] = "localhost,example.internal"
+t._sanitize_proxy_env()
+check("proxy sanitize leaves a clean no_proxy untouched",
+      _os.environ["NO_PROXY"] == "localhost,example.internal")
+if _old_np is None:
+    _os.environ.pop("NO_PROXY", None)
+else:
+    _os.environ["NO_PROXY"] = _old_np
+
+
+class _StubRouter:
+    """Captures the kwargs the bounded paths forward to the router."""
+
+    loaded: list = []
+    loaded_revisions: dict = {}
+
+    def __init__(self):
+        self.batch_kw: dict = {}
+        self.long_kw: dict = {}
+
+    def predict_batch(self, reqs, **kw):
+        self.batch_kw = kw
+        return [{"answers": {}, "routing": {"model": "english"}} for _ in reqs]
+
+    def predict_long(self, state, questions, **kw):
+        self.long_kw = kw
+        return {"answers": {}, "routing": {"model": "english"},
+                "usage": {"windows": 3}}
+
+
+_stub = _StubRouter()
+_saved_router = t._ROUTER
+t._ROUTER = _stub  # type: ignore[assignment]
+try:
+    d = call({"action": "batch", "states": _q(["a", "b", "c"]),
+              "questions": _q({"x": NOUL})})
+    check("batch (stub) ok", d.get("ok") is True and d.get("n") == 3, d.get("e"))
+    check("batch passes batch_size=_FORWARD_BATCH",
+          _stub.batch_kw.get("batch_size") == t._FORWARD_BATCH, _stub.batch_kw)
+    d = call({"action": "long", "state": "hello world", "questions": _q({"x": NOUL})})
+    check("long (stub) ok", d.get("ok") is True and d.get("win") == 3, d.get("e"))
+    check("long passes batch_size=_FORWARD_BATCH",
+          _stub.long_kw.get("batch_size") == t._FORWARD_BATCH, _stub.long_kw)
+finally:
+    t._ROUTER = _saved_router
+
 # --- report -----------------------------------------------------------------
 for status, name, detail in RESULTS:
     print(f"[{status}] {name:52s} {detail}")
