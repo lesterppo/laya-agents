@@ -1,8 +1,8 @@
 """Laya decisions for the Muse runtime — no Hermes agent, no tool registry.
 
 Self-contained port of this repo's ``plugin/laya_tool.py`` (same semantics,
-same validation, including the score-criteria-list rule), adapted to how Muse
-invokes tools:
+same validation, including the score-criteria-list rule and the memory
+bounds below), adapted to how Muse invokes tools:
 
 - No ``tools.registry`` import / ``register()`` — Muse has no Hermes
   registry; the agent calls this module directly.
@@ -12,6 +12,18 @@ invokes tools:
 - Batch-friendly: one long-lived Router per process. A single CLI call per
   decision would pay the ~15-40 s checkpoint load every time, so batch mode
   (``--batch``) runs many requests through one warm process.
+
+Actions (parity with the Hermes tool, upstream laya 0.4.14): decide, schema,
+batch, long, tournament, detect, route, triage, guard, moderation,
+routemodel, email, status.
+
+Memory bounds (the OOM fix, shared with the plugin): upstream
+``predict_batch`` / ``predict_long`` default to ONE forward pass over every
+state/window, so peak RAM grows with the item count — that OOM-killed a
+7 GB test box. The batch and long paths here always pass
+``batch_size=_FORWARD_BATCH`` so peak activation memory stays flat, batch
+states are capped per state, and long states are capped at
+``_LONG_STATE_CAP`` chars.
 
 Runtime notes (applied at import, before anything imports laya):
 - Some sandboxed/proxied environments ship a ``no_proxy``/``NO_PROXY`` with
@@ -28,7 +40,7 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # --- runtime network fixes (must run before anything imports laya) ---
 def _sanitize_proxy_env() -> None:
@@ -64,7 +76,14 @@ _MODELS = ("auto", "english", "multilingual", "typed-decisions")
 _PRESETS = ("triage", "guard", "moderation", "routemodel", "email")
 _MAX_Q = 20
 _MAX_OPTS = 50
+_MAX_TOURNAMENT_OPTS = 400
+_MAX_BATCH = 64
 _INLINE_CAP = 6000
+_STATE_CAP = 8000
+# Long scans materialise many windows per call; see the module docstring.
+_LONG_STATE_CAP = 40_000
+# States/windows per forward pass on the batch and long paths (OOM bound).
+_FORWARD_BATCH = 8
 
 _ROUTER = None
 
@@ -141,7 +160,22 @@ def _parse_json(s: Any, name: str) -> dict:
     return v
 
 
-def _validate_questions(qs: dict) -> None:
+def _parse_json_any(s: Any, name: str) -> Any:
+    """Like _parse_json but accepts arrays too (batch states)."""
+    if isinstance(s, (dict, list)):
+        return s
+    if not isinstance(s, str) or not s.strip():
+        raise LayaError(f"{name} must be a non-empty JSON string")
+    try:
+        v = json.loads(s)
+    except Exception as exc:
+        raise LayaError(f"{name} is not valid JSON: {exc}")
+    if not isinstance(v, (dict, list)) or not v:
+        raise LayaError(f"{name} must be a non-empty JSON object or array")
+    return v
+
+
+def _validate_questions(qs: dict, max_opts: int = _MAX_OPTS) -> None:
     if len(qs) > _MAX_Q:
         raise LayaError(f"too many questions ({len(qs)} > {_MAX_Q})")
     for qid, q in qs.items():
@@ -155,10 +189,10 @@ def _validate_questions(qs: dict) -> None:
         if q["type"] == "choice":
             if not isinstance(crit, dict) or not crit:
                 raise LayaError(f"choice question '{qid}' needs criteria object")
-            if len(crit) > _MAX_OPTS:
+            if len(crit) > max_opts:
                 raise LayaError(
                     f"choice question '{qid}' has {len(crit)} options "
-                    f"(> {_MAX_OPTS}); split or shortlist first"
+                    f"(> {max_opts}); use action=tournament to narrow it by elimination"
                 )
         elif q["type"] == "score":
             if not isinstance(crit, list) or not crit:
@@ -166,6 +200,14 @@ def _validate_questions(qs: dict) -> None:
                     f"score question '{qid}' needs criteria as a non-empty list of "
                     "level descriptions (index 0 = lowest)"
                 )
+
+
+def _round(v: Any) -> Any:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, float):
+        return round(v, 4)
+    return v
 
 
 def _compact_answers(answers: dict) -> dict:
@@ -204,15 +246,43 @@ def _compact_answers(answers: dict) -> dict:
     return out
 
 
+def _predict_kwargs(model: str, task: str = "", lang: str = "",
+                    min_confidence: Optional[float] = None,
+                    max_len: Optional[int] = None) -> Dict[str, Any]:
+    kw: Dict[str, Any] = {}
+    if model and model != "auto":
+        kw["model"] = model
+    if task:
+        kw["task"] = task
+    if lang:
+        kw["lang"] = lang
+    if min_confidence is not None:
+        kw["min_confidence"] = min_confidence
+    if max_len is not None:
+        kw["max_len"] = max_len
+    return kw
+
+
+def _slim(a: dict) -> dict:
+    """Fallback projection when a payload exceeds the inline cap."""
+    return {k: {kk: v.get(kk) for kk in ("choice", "noul", "score", "confidence",
+                                         "answer_confidence")}
+            for k, v in a.items() if isinstance(v, dict)}
+
+
 def _coerce_state(raw: Any) -> Any:
-    if isinstance(raw, dict):
+    if isinstance(raw, (dict, list)):
         return raw
     if isinstance(raw, str) and raw.strip():
-        try:
-            maybe = json.loads(raw)
-            return maybe if isinstance(maybe, dict) else raw
-        except Exception:
-            return raw
+        stripped = raw.strip()
+        if stripped[:1] in ("{", "["):
+            try:
+                v = json.loads(stripped)
+            except Exception:
+                v = None
+            if isinstance(v, (dict, list)):
+                return v
+        return raw
     raise LayaError("state/text must be non-empty (text or JSON object)")
 
 
@@ -253,34 +323,230 @@ def _wrap_state(state: Any, field: str) -> Any:
 def route(state: Any) -> dict:
     """Sub-ms checkpoint routing; loads no model."""
     st = _coerce_state(state)
-    if isinstance(state, str) and len(state) > 8000:
-        raise LayaError("state too long for route probe (>8000 chars)")
+    if isinstance(state, str) and len(state) > _STATE_CAP:
+        raise LayaError(f"state too long for route probe (>{_STATE_CAP} chars)")
     try:
         d = _get_router().route(st, {})
+    except LayaError:
+        raise
     except Exception as exc:
         raise LayaError(f"route failed: {exc}")
+    det = d.get("detection") or {}
     return {"ok": True, "m": d.get("model"), "repo": d.get("repo"),
-            "why": d.get("reason")}
+            "why": d.get("reason"),
+            "lang": det.get("language"), "script": det.get("script")}
+
+
+def detect(state: Any) -> dict:
+    """Language + script detection; loads no model."""
+    st = _coerce_state(state)
+    try:
+        import laya
+
+        d = laya.detect_language(st, explain=True)
+    except Exception as exc:
+        raise LayaError(f"detect failed: {exc}")
+    return {"ok": True, "script": d.get("script"), "lang": d.get("language"),
+            "en": d.get("is_english"), "non_latin": d.get("non_latin_fraction"),
+            "undecided": d.get("language_undecided"),
+            "why": (d.get("diagnostic") or {}).get("reason")}
 
 
 def status() -> dict:
     from pathlib import Path
 
     try:
-        _bootstrap_laya_path()
+        router = _get_router()
         import laya
-
-        loaded = _get_router().loaded
     except Exception as exc:
         raise LayaError(f"status failed: {exc}")
     hf = Path.home() / ".cache" / "huggingface"
     return {"ok": True, "v": getattr(laya, "__version__", "?"),
-            "loaded": loaded, "hf_cache": hf.exists()}
+            "loaded": list(router.loaded or []),
+            "revs": dict(router.loaded_revisions or {}),
+            "hf_cache": hf.exists()}
+
+
+def _run_predict(state: Any, questions: dict, kw: Dict[str, Any]) -> dict:
+    try:
+        router = _get_router()
+    except Exception as exc:
+        return {"ok": False, "e": f"router init failed: {exc}"}
+    t0 = time.time()
+    try:
+        res = router.predict(state, questions, **kw)
+    except TypeError:
+        # older laya without min_confidence / max_len
+        trimmed = {k: v for k, v in kw.items() if k not in ("min_confidence", "max_len")}
+        try:
+            res = router.predict(state, questions, **trimmed)
+        except Exception as exc2:
+            return {"ok": False, "e": f"predict failed: {str(exc2)[:300]}"}
+    except Exception as exc:
+        return {"ok": False, "e": f"predict failed: {str(exc)[:300]}"}
+    ms = int(1000 * (time.time() - t0))
+    routing = res.get("routing", {}) or {}
+    out: dict = {
+        "ok": True,
+        "a": _compact_answers(res.get("answers", {}) or {}),
+        "r": {"m": routing.get("model"), "why": routing.get("reason")},
+        "ms": ms,
+    }
+    usage = res.get("usage") or {}
+    if usage.get("truncated"):
+        out["t"] = True
+    s = json.dumps(out, separators=(",", ":"), ensure_ascii=False)
+    if len(s) > _INLINE_CAP:
+        out["a"] = _slim(out["a"])
+        s = json.dumps(out, separators=(",", ":"), ensure_ascii=False)
+        if len(s) > _INLINE_CAP:
+            return {"ok": False,
+                    "e": f"answer payload too large ({len(s)} chars); ask fewer questions"}
+    return out
+
+
+def _action_schema(state: Any, schema: Any, kw: Dict[str, Any]) -> dict:
+    """JSON-schema-driven typed values (enum choice / integer level / bool)."""
+    try:
+        router = _get_router()
+    except Exception as exc:
+        return {"ok": False, "e": f"router init failed: {exc}"}
+    t0 = time.time()
+    try:
+        res = router.decide(state, schema=schema, return_details=True, **kw)
+    except Exception as exc:
+        return {"ok": False, "e": f"schema decide failed: {str(exc)[:300]}"}
+    ms = int(1000 * (time.time() - t0))
+    conf = getattr(res, "confidence", {}) or {}
+    aconf = getattr(res, "answer_confidence", {}) or {}
+    return {"ok": True, "v": getattr(res, "values", None),
+            "c": {k: _round(v) for k, v in conf.items()},
+            "ac": {k: _round(v) for k, v in aconf.items()},
+            "ms": ms}
+
+
+def _action_batch(states: List[Any], questions: dict, kw: Dict[str, Any]) -> dict:
+    try:
+        router = _get_router()
+    except Exception as exc:
+        return {"ok": False, "e": f"router init failed: {exc}"}
+    t0 = time.time()
+    # predict_batch takes routing hints per request, not per call; batch_size
+    # bounds states per forward pass (see _FORWARD_BATCH).
+    per_req = {k: v for k, v in kw.items()
+               if k in ("model", "task", "lang", "max_len", "head_max_len")}
+    call_kw = {k: v for k, v in kw.items() if k == "min_confidence"}
+    call_kw["batch_size"] = _FORWARD_BATCH
+    reqs = []
+    for s in states:
+        r = {"state": s, "questions": questions}
+        r.update(per_req)
+        reqs.append(r)
+    try:
+        results = router.predict_batch(reqs, **call_kw)
+    except Exception as exc:
+        return {"ok": False, "e": f"batch failed: {str(exc)[:300]}"}
+    ms = int(1000 * (time.time() - t0))
+    out = []
+    for res in results:
+        routing = (res or {}).get("routing", {}) or {}
+        out.append({"a": _compact_answers((res or {}).get("answers", {}) or {}),
+                    "m": routing.get("model")})
+    payload: dict = {"ok": True, "n": len(out), "batch": out, "ms": ms}
+    s = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    if len(s) > _INLINE_CAP:
+        for item in payload["batch"]:
+            item["a"] = _slim(item["a"])
+        s = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        if len(s) > _INLINE_CAP:
+            return {"ok": False,
+                    "e": f"batch payload too large ({len(s)} chars); fewer states or questions"}
+    return payload
+
+
+def _action_long(state: Any, questions: dict, kw: Dict[str, Any],
+                 window: Optional[int], stride: Optional[int]) -> dict:
+    try:
+        router = _get_router()
+    except Exception as exc:
+        return {"ok": False, "e": f"router init failed: {exc}"}
+    t0 = time.time()
+    # predict_long takes routing hints + window/stride; it has no min_confidence.
+    # batch_size caps windows per forward pass (see _FORWARD_BATCH).
+    ckw = {k: v for k, v in kw.items() if k in ("model", "task", "lang")}
+    try:
+        wkw: Dict[str, Any] = {"batch_size": _FORWARD_BATCH}
+        if window:
+            wkw["window"] = window
+        if stride:
+            wkw["stride"] = stride
+        res = router.predict_long(state, questions, **wkw, **ckw)
+    except Exception as exc:
+        return {"ok": False, "e": f"long predict failed: {str(exc)[:300]}"}
+    ms = int(1000 * (time.time() - t0))
+    routing = res.get("routing", {}) or {}
+    usage = res.get("usage") or {}
+    raw = res.get("answers", {}) or {}
+    answers = _compact_answers(raw)
+    for qid, a in answers.items():
+        entry = raw.get(qid)
+        win = entry.get("window") if isinstance(entry, dict) else None
+        if isinstance(win, dict):
+            a["w"] = win.get("index")
+    return {"ok": True, "a": answers, "r": {"m": routing.get("model")},
+            "win": usage.get("windows"), "ms": ms}
+
+
+def _action_tournament(state: Any, questions: dict, kw: Dict[str, Any],
+                       group_size: int) -> dict:
+    try:
+        import laya
+
+        router = _get_router()
+    except Exception as exc:
+        return {"ok": False, "e": f"router init failed: {exc}"}
+    t0 = time.time()
+    try:
+        res = laya.predict_tournament(router, state, questions,
+                                      group_size=group_size, **kw)
+    except Exception as exc:
+        return {"ok": False, "e": f"tournament failed: {str(exc)[:300]}"}
+    ms = int(1000 * (time.time() - t0))
+    routing = res.get("routing", {}) or {}
+    tour = res.get("tournament") or {}
+    narrow = {qid: {"n": m.get("n"), "rounds": m.get("rounds"), "labels": m.get("labels")}
+              for qid, m in tour.items()}
+    return {"ok": True, "a": _compact_answers(res.get("answers", {}) or {}),
+            "r": {"m": routing.get("model")}, "t": narrow, "ms": ms}
+
+
+def _as_float(v: Any, name: str) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except Exception:
+        raise LayaError(f"{name} must be a number")
+
+
+def _as_int(v: Any, name: str) -> Optional[int]:
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except Exception:
+        raise LayaError(f"{name} must be an integer")
 
 
 def predict(action: str = "decide", state: Any = None,
             questions: Any = None, categories: Any = None,
-            model: str = "auto", text: Any = None) -> dict:
+            model: str = "auto", text: Any = None,
+            schema: Any = None, states: Any = None,
+            subject: str = "", sender: str = "",
+            task: str = "", lang: str = "",
+            min_confidence: Any = None, max_len: Any = None,
+            window: Any = None, stride: Any = None,
+            group_size: Any = 16) -> dict:
     """Run one decision. Returns the result dict (``ok``/``a``/``r``/``ms``).
 
     Raises :class:`LayaError` on validation/usage errors; model/predict
@@ -294,60 +560,83 @@ def predict(action: str = "decide", state: Any = None,
     model = str(model or "auto").lower()
     if model not in _MODELS:
         raise LayaError(f"unknown model '{model}'; use one of {list(_MODELS)}")
+    task = str(task or "")
+    lang = str(lang or "")
+    mc = _as_float(min_confidence, "min_confidence")
+    ml = _as_int(max_len, "max_len")
+    kw = _predict_kwargs(model, task, lang, mc, ml)
 
     if action == "status":
         return status()
     if action == "route":
         return route(state if state is not None else text)
+    if action == "detect":
+        return detect(state if state is not None else text)
 
-    if action not in _PRESETS and action != "decide":
-        raise LayaError("unknown action '%s'; use decide|route|triage|guard|"
-                        "moderation|routemodel|email|status" % action)
+    if action == "batch":
+        states_v = _parse_json_any(states, "states")
+        if not isinstance(states_v, list) or not states_v:
+            raise LayaError("states must be a non-empty JSON array")
+        if len(states_v) > _MAX_BATCH:
+            raise LayaError(f"too many states ({len(states_v)} > {_MAX_BATCH})")
+        for s in states_v:
+            slen = len(s) if isinstance(s, str) else len(json.dumps(s, ensure_ascii=False))
+            if slen > _STATE_CAP:
+                raise LayaError(f"batch state too long (>{_STATE_CAP} chars); "
+                                "pass the relevant excerpt per state")
+        qs = _parse_json(questions, "questions")
+        _validate_questions(qs)
+        return _action_batch(states_v, qs, kw)
 
     st = _coerce_state(state if state is not None else text)
-    if isinstance(st, str) and len(st) > 8000:
-        raise LayaError("state too long (>8000 chars); pass the relevant excerpt")
+
+    if action == "schema":
+        schema_v = _parse_json(schema, "schema")
+        return _action_schema(st, schema_v, kw)
+
+    if action == "long":
+        qs = _parse_json(questions, "questions")
+        _validate_questions(qs)
+        if isinstance(st, str) and len(st) > _LONG_STATE_CAP:
+            raise LayaError(f"state too long for long scan (>{_LONG_STATE_CAP} chars)")
+        win = _as_int(window, "window")
+        strd = _as_int(stride, "stride")
+        return _action_long(st, qs, kw, win, strd)
+
+    if action == "tournament":
+        qs = _parse_json(questions, "questions")
+        _validate_questions(qs, max_opts=_MAX_TOURNAMENT_OPTS)
+        gs = _as_int(group_size, "group_size")
+        if gs is None or gs < 2:
+            raise LayaError("group_size must be >= 2")
+        return _action_tournament(st, qs, kw, gs)
+
+    if action not in _PRESETS and action != "decide":
+        raise LayaError("unknown action '%s'; use decide|schema|batch|long|tournament|"
+                        "detect|route|triage|guard|moderation|routemodel|email|status" % action)
+
+    if isinstance(st, str) and len(st) > _STATE_CAP:
+        raise LayaError(f"state too long (>{_STATE_CAP} chars); pass the relevant excerpt")
 
     if action == "decide":
         qs = _parse_json(questions, "questions")
-        field = ""
-    else:
-        cats = _parse_json(categories, "categories") if categories else None
-        qs, field = _preset_questions(action, cats)
-    _validate_questions(qs)
-    if field:
-        st = _wrap_state(st, field)
+        _validate_questions(qs)
+        return _run_predict(st, qs, kw)
 
-    try:
-        router = _get_router()
-    except Exception as exc:
-        return {"ok": False, "e": f"router init failed: {exc}"}
-    t0 = time.time()
-    try:
-        kw: Dict[str, Any] = {}
-        if model != "auto":
-            kw["model"] = model
-        res = router.predict(st, qs, **kw)
-    except Exception as exc:
-        return {"ok": False, "e": f"predict failed: {str(exc)[:300]}"}
-    ms = int(1000 * (time.time() - t0))
-    routing = res.get("routing", {})
-    out: dict = {
-        "ok": True,
-        "a": _compact_answers(res.get("answers", {})),
-        "r": {"m": routing.get("model"), "why": routing.get("reason")},
-        "ms": ms,
-    }
-    s = json.dumps(out, separators=(",", ":"))
-    if len(s) > _INLINE_CAP:
-        out["a"] = {k: {"choice": v.get("choice"), "confidence": v.get("confidence"),
-                        "noul": v.get("noul"), "score": v.get("score")}
-                    for k, v in out["a"].items() if isinstance(v, dict)}
-        s = json.dumps(out, separators=(",", ":"))
-        if len(s) > _INLINE_CAP:
-            return {"ok": False,
-                    "e": f"answer payload too large ({len(s)} chars); ask fewer questions"}
-    return out
+    cats = _parse_json(categories, "categories") if categories else None
+    qs, field = _preset_questions(action, cats)
+    _validate_questions(qs)
+    if action == "email" and (subject or sender):
+        try:
+            import laya
+
+            body = st if isinstance(st, str) else ""
+            st = laya.email_state(str(subject or ""), body, str(sender or "") or None)
+        except Exception as exc:
+            return {"ok": False, "e": f"email state failed: {exc}"}
+    else:
+        st = _wrap_state(st, field)
+    return _run_predict(st, qs, kw)
 
 
 def run_batch(requests: list) -> list:
@@ -364,7 +653,18 @@ def run_batch(requests: list) -> list:
                 state=req.get("state", req.get("text")),
                 questions=req.get("questions"),
                 categories=req.get("categories"),
-                model=req.get("model", "auto")))
+                model=req.get("model", "auto"),
+                schema=req.get("schema"),
+                states=req.get("states"),
+                subject=req.get("subject", "") or "",
+                sender=req.get("sender", "") or "",
+                task=req.get("task", "") or "",
+                lang=req.get("lang", "") or "",
+                min_confidence=req.get("min_confidence"),
+                max_len=req.get("max_len"),
+                window=req.get("window"),
+                stride=req.get("stride"),
+                group_size=req.get("group_size", 16)))
         except LayaError as exc:
             out.append({"ok": False, "e": str(exc)})
         except Exception as exc:  # noqa: BLE001 — batch must survive
@@ -380,8 +680,19 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--state")
     ap.add_argument("--text")
     ap.add_argument("--questions")
+    ap.add_argument("--schema")
+    ap.add_argument("--states")
     ap.add_argument("--categories")
+    ap.add_argument("--subject", default="")
+    ap.add_argument("--sender", default="")
     ap.add_argument("--model", default="auto")
+    ap.add_argument("--task", default="")
+    ap.add_argument("--lang", default="")
+    ap.add_argument("--min-confidence", dest="min_confidence")
+    ap.add_argument("--max-len", dest="max_len")
+    ap.add_argument("--window")
+    ap.add_argument("--stride")
+    ap.add_argument("--group-size", dest="group_size", default=16)
     ap.add_argument("--batch",
                     help="JSONL file (or - for stdin) of request objects; "
                          "one warm process handles all lines, one JSON object "
@@ -414,7 +725,11 @@ def main(argv: Optional[list] = None) -> int:
     try:
         d = predict(action=ns.action, state=ns.state, text=ns.text,
                     questions=ns.questions, categories=ns.categories,
-                    model=ns.model)
+                    model=ns.model, schema=ns.schema, states=ns.states,
+                    subject=ns.subject, sender=ns.sender,
+                    task=ns.task, lang=ns.lang,
+                    min_confidence=ns.min_confidence, max_len=ns.max_len,
+                    window=ns.window, stride=ns.stride, group_size=ns.group_size)
     except LayaError as exc:
         print(json.dumps({"ok": False, "e": str(exc)}, separators=(",", ":")))
         return 0
