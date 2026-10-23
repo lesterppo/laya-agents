@@ -74,8 +74,10 @@ label that was chosen). With `min_confidence` set, each answer also reports
 - Checkpoints occupy ~1.5 GB under `~/.cache/huggingface`.
 - `typed-decisions` is fine-tune-specific: base checkpoints are near-chance on its
   workflows zero-shot. Fine-tune before relying on it.
-- `long` caps the state at 40 000 chars: on a small box a wide window set
-  exhausts RAM and the process is OOM-killed.
+- `long` caps the state at 40 000 chars and chunks its windows 8 per
+  forward pass (upstream's single-pass default OOM-killed a 7 GB box —
+  exit 137 — on a wide multilingual scan). `batch` chunks the same way
+  and caps each state at 8 000 chars.
 - laya + torch live in `~/.hermes/laya-venv` (dedicated venv), NOT in the
   Hermes managed environment: torch's PyPI wheel drags in CUDA, and
   `hermes update` drops undeclared packages. `scripts/install_laya_env.sh`
