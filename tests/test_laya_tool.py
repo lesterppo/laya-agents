@@ -2,7 +2,7 @@
 """Offline validation battery for the Laya Hermes tool.
 
 No model download and no network: only the validation, dispatch and guard paths
-are exercised. Live inference is documented in skills/laya-decisions/SKILL.md.
+are exercised. Live inference is in tests/test_laya_live.py.
 
     python tests/test_laya_tool.py
 """
@@ -18,7 +18,7 @@ import laya_tool as t  # noqa: E402
 RESULTS: list[tuple[str, str, str]] = []
 
 
-def check(name: str, ok: bool, detail: str = "") -> None:
+def check(name: str, ok: bool, detail: object = "") -> None:
     RESULTS.append(("PASS" if ok else "FAIL", name, str(detail)[:90]))
 
 
@@ -44,6 +44,9 @@ for bad in ["", "   ", None]:
 
 d = call({"action": "route", "state": ""})
 check("route rejects empty state", d.get("ok") is False, d.get("e"))
+
+d = call({"action": "detect", "state": "   "})
+check("detect rejects empty state", d.get("ok") is False, d.get("e"))
 
 d = call({"action": "route", "state": "z" * 9000})
 check("route rejects oversized state", d.get("ok") is False, d.get("e"))
@@ -80,6 +83,48 @@ d = call({"action": "decide", "state": "hello",
           "questions": _q({"x": {"type": "choice", "instructions": "hi",
                                  "criteria": {f"o{i}": None for i in range(77)}}})})
 check("rejects >50 options (token budget)", d.get("ok") is False, d.get("e"))
+check("decide >50 options points at tournament",
+      "tournament" in str(d.get("e", "")), d.get("e"))
+
+# tournament accepts the wide set decide rejects
+d = call({"action": "tournament", "state": "hello",
+          "questions": _q({"x": {"type": "choice", "instructions": "hi",
+                                 "criteria": {f"o{i}": None for i in range(77)}}})})
+check("tournament accepts >50 options (validation only)",
+      d.get("ok") is False and "router init failed" in str(d.get("e", "")) or d.get("ok") is True,
+      d.get("e"))
+
+d = call({"action": "tournament", "state": "hello",
+          "questions": _q({"x": CHOICE}), "group_size": 1})
+check("tournament rejects group_size < 2", d.get("ok") is False, d.get("e"))
+
+# --- validation: new actions ------------------------------------------------
+d = call({"action": "schema", "state": "hello", "schema": "not json"})
+check("schema rejects bad schema JSON", d.get("ok") is False, d.get("e"))
+
+d = call({"action": "schema", "state": "hello", "schema": "[]"})
+check("schema rejects non-object schema", d.get("ok") is False, d.get("e"))
+
+d = call({"action": "batch", "state": "hello", "questions": _q({"x": NOUL})})
+check("batch rejects missing states", d.get("ok") is False, d.get("e"))
+
+d = call({"action": "batch", "states": "{}", "questions": _q({"x": NOUL})})
+check("batch rejects non-array states", d.get("ok") is False, d.get("e"))
+
+d = call({"action": "batch", "states": _q(["a"] * 100), "questions": _q({"x": NOUL})})
+check("batch rejects >64 states", d.get("ok") is False, d.get("e"))
+
+d = call({"action": "long", "state": "hello", "questions": _q({"x": NOUL}),
+          "window": "abc"})
+check("long rejects non-integer window", d.get("ok") is False, d.get("e"))
+
+d = call({"action": "decide", "state": "x", "questions": _q({"x": NOUL}),
+          "min_confidence": "high"})
+check("rejects non-numeric min_confidence", d.get("ok") is False, d.get("e"))
+
+d = call({"action": "decide", "state": "x", "questions": _q({"x": NOUL}),
+          "max_len": "big"})
+check("rejects non-integer max_len", d.get("ok") is False, d.get("e"))
 
 # --- validation: action / model --------------------------------------------
 d = call({"action": "frobnicate", "state": "x"})
@@ -100,38 +145,70 @@ check("_err yields ok:false", json.loads(t._err("boom"))["ok"] is False)
 ok, val, _ = t._parse_json('{"a":1}', "questions")
 check("_parse_json accepts dict", ok and val == {"a": 1})
 ok, _, msg = t._parse_json("[1,2]", "questions")
-check("_parse_json rejects array", not ok and "JSON" in msg or "object" in msg)
+check("_parse_json rejects array", not ok and ("JSON" in msg or "object" in msg))
 ok, val, _ = t._parse_json({"a": 1}, "questions")
 check("_parse_json passes through dicts", ok and val == {"a": 1})
+
+ok, val, msg = t._parse_json_any('["a","b"]', "states")
+check("_parse_json_any accepts array", ok and val == ["a", "b"], msg)
+ok, _, msg = t._parse_json_any("{}", "states")
+check("_parse_json_any rejects empty object", not ok, msg)
 
 ok, msg = t._validate_questions({"a": CHOICE, "b": NOUL})
 check("_validate_questions accepts valid set", ok, msg)
 ok, msg = t._validate_questions({"a": {"type": "choice", "instructions": "x", "criteria": []}})
 check("_validate_questions rejects list criteria", not ok, msg)
+ok, msg = t._validate_questions({"a": {"type": "score", "instructions": "x", "criteria": {}}})
+check("_validate_questions rejects dict criteria for score", not ok, msg)
+ok, msg = t._validate_questions({"a": {"type": "score", "instructions": "x", "criteria": ["lo", "hi"]}})
+check("_validate_questions accepts list criteria for score", ok, msg)
+ok, msg = t._validate_questions(
+    {"a": {"type": "choice", "instructions": "x", "criteria": {f"o{i}": None for i in range(77)}}},
+    max_opts=t._MAX_TOURNAMENT_OPTS)
+check("_validate_questions honours max_opts override", ok, msg)
 
+# 0.4.x answer shape: probabilities / answer_confidence / legend / abstention
 comp = t._compact_answers({"q": {"type": "choice", "choice": "a",
                                  "confidence": 0.123456,
+                                 "answer_confidence": 0.98765,
                                  "probabilities": {"a": 0.9, "b": 0.1},
+                                 "legend": {"0": "low"},
+                                 "abstention": "passed",
+                                 "action": {"act_probability": 1.0},
                                  "extra_ignored": "noise"}})
 check("_compact_answers keeps known keys only",
-      comp["q"].get("choice") == "a" and "extra_ignored" not in comp["q"])
+      comp["q"].get("choice") == "a" and "extra_ignored" not in comp["q"]
+      and "action" not in comp["q"])
 check("_compact_answers rounds floats", comp["q"]["confidence"] == 0.1235)
+check("_compact_answers keeps answer_confidence",
+      comp["q"]["answer_confidence"] == 0.9877)
+check("_compact_answers keeps probabilities",
+      comp["q"].get("p", {}).get("a") == 0.9)
+check("_compact_answers keeps legend", comp["q"].get("legend") == {"0": "low"})
+check("_compact_answers keeps abstention", comp["q"].get("abstention") == "passed")
 
 # --- preset resolution (imports laya, no model load) ------------------------
 try:
     for preset in ("triage", "guard", "moderation", "routemodel", "email"):
-        qs = t._preset_questions(preset)
+        qs, field = t._preset_questions(preset)
         check(f"preset {preset} resolves", isinstance(qs, dict) and bool(qs))
-    ok, msg = t._validate_questions(t._preset_questions("triage"))
+        check(f"preset {preset} names its state field",
+              isinstance(field, str) and bool(field), field)
+    ok, msg = t._validate_questions(t._preset_questions("triage")[0])
     check("triage preset passes validation", ok, msg)
-    ok, msg = t._validate_questions(t._preset_questions("guard"))
+    ok, msg = t._validate_questions(t._preset_questions("guard")[0])
     check("guard preset passes validation", ok, msg)
+    # the field is what the preset actually reads
+    _, triage_field = t._preset_questions("triage")
+    check("triage reads `message`", triage_field == "message", triage_field)
+    _, email_field = t._preset_questions("email")
+    check("email reads `body`", email_field == "body", email_field)
 except ImportError:
     check("presets resolve (laya installed)", False, "laya not importable — skipped")
 
 # --- report -----------------------------------------------------------------
 for status, name, detail in RESULTS:
-    print(f"[{status}] {name:46s} {detail}")
+    print(f"[{status}] {name:52s} {detail}")
 fails = sum(1 for s, _, _ in RESULTS if s == "FAIL")
 print(f"\n{len(RESULTS) - fails}/{len(RESULTS)} passed")
 sys.exit(1 if fails else 0)

@@ -28,7 +28,7 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 # --- runtime network fixes (must run before anything imports laya) ---
 def _sanitize_proxy_env() -> None:
@@ -73,9 +73,53 @@ class LayaError(Exception):
     """Validation or usage error — raised, not returned."""
 
 
+# laya + torch live in a dedicated venv (~/.hermes/laya-venv): torch's PyPI
+# wheel drags in the CUDA runtime, and the managed-env resolver does not use
+# the CPU index. Appending its site-packages keeps `import laya` working
+# without a global install. Appended, not inserted, so packages already
+# present keep priority.
+_LAYA_VENV = os.path.expanduser("~/.hermes/laya-venv")
+
+
+def _bootstrap_laya_path() -> bool:
+    """Make the dedicated laya venv importable from this interpreter."""
+    if "laya" in sys.modules:
+        return True
+    try:
+        import laya  # noqa: F401
+
+        return True
+    except Exception:
+        pass
+    lib = os.path.join(_LAYA_VENV, "lib")
+    if not os.path.isdir(lib):
+        return False
+    cands = [os.path.join(lib, e, "site-packages")
+             for e in sorted(os.listdir(lib)) if e.startswith("python")]
+    mine = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    cands.sort(key=lambda p: (not p.startswith(os.path.join(lib, mine)), p))
+    for sp in cands:
+        if not os.path.isdir(sp):
+            continue
+        if sp not in sys.path:
+            sys.path.append(sp)
+        try:
+            import laya  # noqa: F401
+
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def _get_router():
     global _ROUTER
     if _ROUTER is None:
+        if not _bootstrap_laya_path():
+            raise LayaError(
+                "laya not installed: run scripts/install_laya_env.sh, or "
+                "pip install laya (needs python>=3.10, torch, transformers)"
+            )
         from laya import Router
 
         _ROUTER = Router()
@@ -125,25 +169,37 @@ def _validate_questions(qs: dict) -> None:
 
 
 def _compact_answers(answers: dict) -> dict:
+    """Token-efficient projection of laya 0.4.x answer dicts.
+
+    0.4.x answer keys: type, choice|noul|score, probabilities, legend,
+    confidence, answer_confidence, action, abstention, abstention_threshold.
+    """
     out: dict = {}
     for qid, a in answers.items():
         if not isinstance(a, dict):
             out[qid] = a
             continue
         c: dict = {}
-        for k in ("choice", "confidence", "noul", "score", "probs",
-                  "distribution", "p", "label"):
+        for k in ("choice", "noul", "score", "confidence", "answer_confidence",
+                  "abstention", "abstention_threshold", "legend", "type"):
             if k in a:
                 v = a[k]
                 if isinstance(v, dict):
-                    v = {kk: round(float(vv), 4) for kk, vv in
-                         list(v.items())[:_MAX_OPTS]}
+                    # legend values are level DESCRIPTIONS (strings); only the
+                    # numeric ones get rounded.
+                    v = {kk: (round(float(vv), 4) if isinstance(vv, (int, float))
+                              and not isinstance(vv, bool) else vv)
+                         for kk, vv in list(v.items())[:_MAX_OPTS]}
                 elif isinstance(v, float):
                     v = round(v, 4)
                 elif isinstance(v, list):
                     v = [round(float(x), 4) if isinstance(x, (int, float))
-                         else x for x in v[:_MAX_OPTS]]
+                         and not isinstance(x, bool) else x for x in v[:_MAX_OPTS]]
                 c[k] = v
+        probs = a.get("probabilities")
+        if isinstance(probs, dict):
+            items = sorted(probs.items(), key=lambda kv: -float(kv[1]))[:12]
+            c["p"] = {str(kk): round(float(vv), 4) for kk, vv in items}
         out[qid] = c or {k: str(v)[:200] for k, v in list(a.items())[:6]}
     return out
 
@@ -160,20 +216,38 @@ def _coerce_state(raw: Any) -> Any:
     raise LayaError("state/text must be non-empty (text or JSON object)")
 
 
-def _preset_questions(name: str, categories: Optional[dict] = None) -> dict:
+def _preset_questions(name: str, categories: Optional[dict] = None) -> Tuple[dict, str]:
+    """Return (questions, state_field) for a preset.
+
+    laya presets name the state field they read (`message` for triage, `body`
+    for email, `prompt` for guard, `post` for moderation, `request` for
+    routemodel). Handing raw text over under the wrong key silently degrades
+    the answer, so the field is resolved from the preset itself via
+    laya.presets.state_field().
+    """
     import laya
+    from laya import presets as _presets
 
     if name == "triage":
-        return laya.triage_questions()
-    if name == "guard":
-        return laya.guard_questions()
-    if name == "moderation":
-        return laya.moderation_questions()
-    if name == "routemodel":
-        return laya.router_questions()
-    if name == "email":
-        return laya.email_questions(categories or None)
-    raise LayaError(f"unknown preset '{name}'")
+        q = laya.triage_questions()
+    elif name == "guard":
+        q = laya.guard_questions()
+    elif name == "moderation":
+        q = laya.moderation_questions()
+    elif name == "routemodel":
+        q = laya.router_questions()
+    elif name == "email":
+        q = laya.email_questions(categories or None)
+    else:
+        raise LayaError(f"unknown preset '{name}'")
+    return q, _presets.state_field(q) or "text"
+
+
+def _wrap_state(state: Any, field: str) -> Any:
+    """Put plain text under the field the preset reads; pass dicts through."""
+    if isinstance(state, dict):
+        return state
+    return {field: state}
 
 
 def route(state: Any) -> dict:
@@ -193,6 +267,7 @@ def status() -> dict:
     from pathlib import Path
 
     try:
+        _bootstrap_laya_path()
         import laya
 
         loaded = _get_router().loaded
@@ -212,11 +287,9 @@ def predict(action: str = "decide", state: Any = None,
     failures are returned as ``{"ok": False, "e": ...}`` so batch runs
     survive them.
     """
-    try:
-        import laya  # noqa: F401
-    except Exception:
-        raise LayaError("laya not installed: pip install laya "
-                        "(needs python>=3.10, torch, transformers)")
+    if not _bootstrap_laya_path():
+        raise LayaError("laya not installed: run scripts/install_laya_env.sh, or "
+                        "pip install laya (needs python>=3.10, torch, transformers)")
     action = str(action or "decide").lower()
     model = str(model or "auto").lower()
     if model not in _MODELS:
@@ -237,10 +310,13 @@ def predict(action: str = "decide", state: Any = None,
 
     if action == "decide":
         qs = _parse_json(questions, "questions")
+        field = ""
     else:
         cats = _parse_json(categories, "categories") if categories else None
-        qs = _preset_questions(action, cats)
+        qs, field = _preset_questions(action, cats)
     _validate_questions(qs)
+    if field:
+        st = _wrap_state(st, field)
 
     try:
         router = _get_router()

@@ -51,27 +51,71 @@ An LLM classification call costs 500–2000+ tokens. The same judgment here is
 | action | purpose |
 |---|---|
 | `decide` | state + your own typed questions (`choice`/`score`/`noul`) |
+| `schema` | a JSON Schema in, typed values out (enum → label, bounded int → level, bool) |
+| `batch` | many states, **one** forward pass — order preserved |
+| `long` | windowed scan of a long document; reports the deciding window |
+| `tournament` | narrows a wide choice (>50 options) by elimination rounds |
+| `detect` | language + script detection — **no model load**, sub-ms |
 | `route` | which checkpoint fits this input — **no model load**, sub-ms |
 | `triage` | support-ticket preset (intent, urgency, frustration, refund, churn) |
 | `guard` | prompt guardrails (jailbreak, prompt injection, sensitive data, harm) |
 | `moderation` | content safety (toxic, harassment, threat, spam, severity) |
 | `routemodel` | model-routing preset (difficulty, domain, needs_tools, is_sensitive) |
 | `email` | inbound email triage (category, spam, phishing, urgency, needs_reply) |
-| `status` | version, loaded checkpoints, cache presence |
+| `status` | version, loaded checkpoints + pinned revisions, cache presence |
+
+New in upstream 0.4.14. `schema` returns real typed values instead of answer
+dicts, `batch` shares forward passes across many items, `long` scans documents
+past the single-window limit, `tournament` narrows a wide choice set without an
+embedder, and `detect` answers "which language is this?" without loading a
+checkpoint.
 
 The Router picks `english` / `multilingual` / `typed-decisions` per request from
 sub-millisecond script detection, so non-Latin input never silently hits the English
 checkpoint (which scores 0.000 at 0.95 confidence on Khmer — confidence gating cannot
 save a wrong-checkpoint call, so route *before* the forward pass).
 
+Measured routing (0.4.14, `route` action, 0.4 ms each):
+
+| input | checkpoint | why |
+|---|---|---|
+| English | `english` | English Latin text |
+| Traditional Chinese | `multilingual` | non-Latin script (han, 100% of letters) |
+| Hindi | `multilingual` | non-Latin script (devanagari, 100%) |
+| German / French / Spanish | `multilingual` | Latin script, but the language is not English |
+
+Anything that is not English goes to the multilingual checkpoint, Latin script
+included — the English checkpoint collapses on it while staying confident.
+
 ## Hermes Agent integration
 
 Native plugin in `plugin/`. Install:
 
 ```bash
-pip install laya                 # needs Python >= 3.10, torch, transformers
 git clone https://github.com/lesterppo/laya-agents
-cd laya-agents && ./install.sh
+cd laya-agents
+./scripts/install_laya_env.sh    # laya + CPU-only torch into ~/.hermes/laya-venv
+./install.sh                     # plugin + skill into ~/.hermes/
+```
+
+`scripts/install_laya_env.sh` builds a **dedicated venv** at
+`~/.hermes/laya-venv` with `laya` and the CPU torch wheel, and the tool adds
+that venv's `site-packages` to `sys.path` at import time. Two reasons:
+
+- torch's PyPI wheel drags the whole CUDA runtime in (~2.5 GB of `nvidia-*`
+  packages); the CPU wheel only exists on `download.pytorch.org`, which the
+  managed-env resolver does not use;
+- `hermes update` regenerates the managed environment and silently drops
+  undeclared third-party packages, so a `pip install laya` into it does not
+  survive. A venv under `~/.hermes/` does.
+
+The venv is appended to `sys.path` (not inserted), so packages already present
+in the Hermes environment keep priority.
+
+To run it without the plugin (Muse module, plain scripts):
+
+```bash
+pip install laya                 # needs Python >= 3.10, torch, transformers
 ```
 
 `install.sh` copies the plugin into `~/.hermes/plugins/hermes_laya/` (outside the
@@ -102,10 +146,21 @@ Pointer-style output (`ok`, `a` answers, `r` routing, `ms`):
 
 ```json
 {"ok":true,
- "a":{"department":{"choice":"billing","confidence":0.82},
-      "churn_risk":{"confidence":0.86,"noul":0.86}},
+ "a":{"department":{"type":"choice","choice":"billing","confidence":0.8106,
+                    "answer_confidence":0.9563,
+                    "p":{"billing":0.9563,"technical":0.0282,"sales":0.0155}},
+      "churn_risk":{"type":"noul","noul":0.86,"confidence":0.86}},
  "r":{"m":"english","why":"English Latin text"},"ms":1203}
 ```
+
+Two confidences per answer, and they answer different questions:
+
+- `confidence` — the confidence in the *decision* (0.8106 above)
+- `answer_confidence` — the probability of the *label that was chosen* (0.9563)
+
+Gate on `confidence`. For a `score`, `confidence` stays low (the ordinal
+primitive is weak) while `answer_confidence` is the level's own probability —
+`legend` maps the level index back to its description.
 
 ## Muse integration
 
@@ -148,22 +203,40 @@ else:
     escalate_to_human(dept)            # defer
 ```
 
-Measured behavior that makes the gate safe:
+Measured behavior that makes the gate safe (live run, upstream 0.4.14, CPU-only):
 
-- Clear cases: billing 0.82–0.93, refund 0.87–0.99, churn 0.74–0.86, jailbreak 1.0,
-  threat 0.92, prompt injection 1.0.
-- Multilingual: Hindi 0.91, German 0.98, Traditional Chinese 0.999 (all routed to
-  the multilingual checkpoint automatically).
-- **Ambiguous input is honestly uncertain**: an off-topic message scored 0.03
-  confidence where the choice itself was arbitrary. That near-zero confidence is the
-  escalation signal, not a bug.
+- Clear cases: jailbreak **1.0**, prompt injection **1.0**, triage intent=refund
+  **0.9935**, refund_requested 0.9613, routemodel domain=code **0.9823**,
+  email category=security 0.9703, moderation toxic 0.8095 / harassment 0.788 /
+  threat 0.7161.
+- Multilingual: a Hindi refund request scored **0.9818** on the multilingual
+  checkpoint, routed automatically.
+- **Ambiguous input is honestly uncertain**: "hmm, maybe? unclear" scored 0.2283
+  on a yes/no question — near-zero confidence is the escalation signal, not a bug.
+
+Pass `min_confidence` and laya reports the gate's verdict per answer instead of
+leaving you to compare numbers yourself:
+
+```python
+laya(action="decide", state=text, questions=..., min_confidence=0.85)
+# -> {"noul":0.2283,"confidence":0.7717,"abstention":"abstained",
+#     "abstention_threshold":0.85}
+```
+
+`abstention` is one of `passed` / `abstained` / `unevaluated` — `unevaluated`
+means the answer carried no usable confidence, which a boolean cannot express.
 
 ## Honest limits (measured, not marketing)
 
 - **`score` is the weakest primitive.** Ordinal urgency/severity/frustration returned
-  0.05–0.24 confidence. Use it as a soft signal; never auto-act on a score alone.
-- **High-cardinality choice degrades.** Options share a fixed token budget; >50 labels
-  in one question needs shortlisting or splitting first (the tool rejects >50 loudly).
+  0.05–0.19 confidence on 0.4.14 (the level's own probability, 0.36–0.72, is
+  stronger). Use it as a soft signal; never auto-act on a score alone.
+- **High-cardinality choice degrades.** Options share a fixed token budget; `decide`
+  rejects >50 labels loudly and points you at `action=tournament`, which narrows
+  the field by elimination rounds (no embedder needed) before the final pass.
+- **Long-document scans are RAM-hungry.** A wide window set on a small box
+  exhausts RAM and the process is OOM-killed, so `long` caps the state at 40 000
+  chars; raise `max_len`/`window` only on a machine with headroom.
 - **`typed-decisions` checkpoint is fine-tune-specific.** Base checkpoints are
   near-chance on its workflows zero-shot; use the English/multilingual checkpoints for
   general work and fine-tune before relying on the typed-decisions head.
@@ -236,8 +309,10 @@ plugin/README.md           # drop-in plugin layout
 muse/laya_muse.py          # Muse-native module: Python API + batch mode, no registry
 muse/bin/laya              # thin CLI wrapper over the module
 muse/README.md             # Muse integration usage
+scripts/install_laya_env.sh # laya + CPU torch into ~/.hermes/laya-venv (durable)
 skills/laya-decisions/     # Hermes skill: actions, measurements, usage rules
 tests/test_laya_tool.py    # offline validation battery (no model download needed)
+tests/test_laya_live.py    # live inference battery (real model, every action)
 tests/test_privacy_sweep.py # scanner regression: redaction + tracked-files-only
 install.sh                 # plugin + skill installer (Hermes)
 privacy_sweep.py           # pre-push identifier scan
@@ -246,12 +321,15 @@ privacy_sweep.py           # pre-push identifier scan
 ## Testing
 
 ```bash
-python tests/test_laya_tool.py          # offline: validation, action dispatch, guards (37 cases)
+python tests/test_laya_tool.py          # offline: validation, dispatch, guards (65 cases)
+python tests/test_laya_live.py          # live: real model, every action
+python tests/test_laya_live.py --quick  # live, skipping the slow long/tournament cases
 ```
 
-The offline battery exercises validation and guard paths only. Live inference tests
-require `pip install laya` and are documented in the skill
-(`skills/laya-decisions/SKILL.md`).
+The offline battery exercises validation and guard paths only. The live battery
+runs the real checkpoints: every action, both checkpoints, multilingual routing,
+the confidence gate, schema-driven decisions, batch, long-document scanning and
+tournament narrowing.
 
 ## License
 

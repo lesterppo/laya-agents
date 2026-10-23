@@ -20,9 +20,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import privacy_sweep  # noqa: E402
 
 # Fake secrets used only to verify redaction. Never real.
-FAKE_GITHUB_TOKEN = "ghp_faketoken1234567890abcdef"
-FAKE_NVIDIA_KEY = "nvapi-faketoken1234567890abcdef"
-FAKE_OPENAI_KEY = "sk-faketoken1234567890abcdef12"
+# They are ASSEMBLED at runtime: a literal token in this file would itself
+# match the scanner's own patterns, so the sweep would flag its own test
+# fixtures (which is exactly what happened before this was split up).
+FAKE_GITHUB_TOKEN = "ghp_" + "faketoken" + "1234567890abcdef"
+FAKE_NVIDIA_KEY = "nvapi-" + "faketoken" + "1234567890abcdef"
+FAKE_OPENAI_KEY = "sk-" + "faketoken" + "123456789012"
 
 
 def _git_init(root: Path):

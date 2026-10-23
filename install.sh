@@ -6,6 +6,7 @@
 # toolsets.py, which are reset on every update).
 #
 # Usage: ./install.sh [--hermes-home DIR] [--uninstall]
+# Env:   SKIP_DEPS=1  skip the laya venv install (already set up)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,12 +37,24 @@ if [ ! -d "$HERMES_HOME" ]; then
   exit 1
 fi
 
+# Dependency install — laya + torch live in a dedicated venv, NOT in the Hermes
+# managed environment:
+#   - torch's PyPI wheel drags the whole CUDA runtime in; the CPU wheel only
+#     exists on download.pytorch.org, which the managed-env resolver does not use;
+#   - `hermes update` regenerates the managed environment and silently drops
+#     undeclared third-party packages.
+# The tool appends that venv's site-packages to sys.path, so `import laya` works
+# inside Hermes and survives env regeneration.
+if [ "${SKIP_DEPS:-0}" != "1" ]; then
+  "$HERE/scripts/install_laya_env.sh"
+fi
+
 # Dependency check — the tool gates on `import laya`, but fail loudly at install
 # time so the user does not silently get a missing tool.
 PY="${PYTHON:-python3}"
 if ! "$PY" -c "import laya" >/dev/null 2>&1; then
   echo "warning: 'laya' is not importable by $PY"
-  echo "         install it with:  pip install laya   (needs Python >= 3.10, torch, transformers)"
+  echo "         install it with:  ./scripts/install_laya_env.sh   (or: pip install laya)"
 fi
 
 mkdir -p "$PLUGIN_DIR" "$SKILL_DIR"

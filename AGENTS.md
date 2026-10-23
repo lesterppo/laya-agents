@@ -26,13 +26,23 @@ what the LLM is for. Laya is the cheap first pass, not an answer generator.
 | action | what it returns |
 |---|---|
 | `decide` | answers to your own questions: `choice` (label + probabilities + confidence), `score` (ordinal + distribution), `noul` (calibrated P(true)) |
+| `schema` | typed values from a JSON Schema: enum → label, bounded int → level, bool → bool, plus per-field confidence |
+| `batch` | many states in one forward pass, input order preserved |
+| `long` | windowed scan of a long document, with the deciding window index |
+| `tournament` | a wide choice (>50 options) narrowed by elimination rounds |
+| `detect` | language + script, with the reason. **No model load** — sub-ms |
 | `route` | which checkpoint this input needs, with the reason. **No model load** — sub-ms, safe to call first |
 | `triage` | intent, is_urgent, frustration, refund_requested, churn_risk |
 | `guard` | jailbreak, prompt_injection, sensitive_data, harm_severity, topic |
 | `moderation` | toxic, harassment, threat, spam, severity |
 | `routemodel` | difficulty, domain, needs_tools, is_sensitive |
 | `email` | category, is_spam, is_phishing, urgency, needs_reply |
-| `status` | laya version, loaded checkpoints, HF cache presence |
+| `status` | laya version, loaded checkpoints + pinned revisions, HF cache presence |
+
+Targets upstream laya **0.4.14**. Two confidences come back per answer:
+`confidence` (in the decision — gate on this) and `answer_confidence` (in the
+label that was chosen). With `min_confidence` set, each answer also reports
+`abstention`: `passed` / `abstained` / `unevaluated`.
 
 `model` defaults to `auto` (Router decides). Override with `english`,
 `multilingual`, or `typed-decisions` only when you have a reason.
@@ -45,8 +55,9 @@ what the LLM is for. Laya is the cheap first pass, not an answer generator.
 2. **Never auto-act on a `score` alone.** Ordinal questions are the weakest
    primitive (measured confidences 0.05–0.24).
 3. **Know the cardinality limit.** One `choice` question tops out at ~50 options
-   before the per-label token budget collapses; shortlist or split beyond that.
-   The tool rejects >50 options instead of silently degrading.
+   before the per-label token budget collapses; `decide` rejects >50 instead of
+   silently degrading and points you at `action=tournament`, which narrows the
+   field by elimination rounds (no embedder needed).
 4. **Keep questions to 20 per call** and batch them: one forward pass answers all of
    them, which is where the 7 ms/question throughput comes from.
 5. **Trust the Router for script detection.** The English checkpoint does not
@@ -57,17 +68,30 @@ what the LLM is for. Laya is the cheap first pass, not an answer generator.
 
 ## Cost of ownership
 
-- First call in a process loads the checkpoint from disk (~35–40 s, disk-bound).
-  Keep one long-lived session/router; later calls are ~140 ms (multilingual) or
-  ~1–2 s (English).
+- First call in a process loads the checkpoint from disk (~10 s, disk-bound).
+  Keep one long-lived session/router; later calls are ~1.8–3.0 s for the
+  5-question English presets, ~1.0 s for a batch of 4 states.
 - Checkpoints occupy ~1.5 GB under `~/.cache/huggingface`.
 - `typed-decisions` is fine-tune-specific: base checkpoints are near-chance on its
   workflows zero-shot. Fine-tune before relying on it.
+- `long` caps the state at 40 000 chars: on a small box a wide window set
+  exhausts RAM and the process is OOM-killed.
+- laya + torch live in `~/.hermes/laya-venv` (dedicated venv), NOT in the
+  Hermes managed environment: torch's PyPI wheel drags in CUDA, and
+  `hermes update` drops undeclared packages. `scripts/install_laya_env.sh`
+  builds it; the tool appends its site-packages to `sys.path`.
 
 ## Layout
 
 ```
 plugin/    Hermes plugin (__init__.py, plugin.yaml, laya_tool.py)
 skills/    Hermes skill: laya-decisions
-tests/     offline validation battery (python tests/test_laya_tool.py)
+scripts/   install_laya_env.sh — laya + CPU torch into ~/.hermes/laya-venv
+tests/     offline battery (tests/test_laya_tool.py) + live battery
+           (tests/test_laya_live.py)
+muse/      Muse-native module + batch CLI (no Hermes)
 ```
+
+Presets read a NAMED state field (`message`, `body`, `prompt`, `post`,
+`request`); the tool wraps plain text under it automatically via
+`laya.presets.state_field()`.
