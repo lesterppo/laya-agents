@@ -44,6 +44,7 @@ muse/bin/laya --action decide --state "Billed twice for March. Refund the duplic
     "criteria":{"billing":"invoices, payments, refunds","technical":"bugs, outages","sales":"pricing"}},
     "churn_risk":{"type":"noul","instructions":"Threaten to cancel?"}}'
 muse/bin/laya --action route --state "我被重複收了兩次費用"   # sub-ms, no model load
+muse/bin/laya --action detect --state "我被重複收了兩次費用"  # sub-ms, no model load
 muse/bin/laya --action status
 ```
 
@@ -75,9 +76,14 @@ failures come back as `{"ok": False, "e": ...}` so batch runs survive them.
 
 ## Actions
 
-Same eight as the Hermes plugin: `decide`, `route`, `triage`, `guard`,
-`moderation`, `routemodel`, `email`, `status`. See the repo root README for
-what each returns.
+All thirteen actions of the Hermes plugin: `decide`, `schema`, `batch`,
+`long`, `tournament`, `detect`, `route`, `triage`, `guard`, `moderation`,
+`routemodel`, `email`, `status`. See the repo root README for what each
+returns. Extra parameters mirror the plugin too: `schema`, `states`,
+`subject`/`sender` (email), `task`, `lang`, `min_confidence`, `max_len`,
+`window`/`stride` (long), `group_size` (tournament) — as `predict()`
+keyword arguments, CLI flags (`--schema`, `--min-confidence`, …), or keys
+of a batch-mode request object.
 
 ## Usage rules (measured)
 
@@ -88,8 +94,15 @@ what each returns.
   primitive (measured 0.05–0.24 confidence). `score` questions need
   `criteria` as a **list** of level descriptions (index 0 first).
 - **One `choice` question tops out at ~50 options**; the module rejects
-  >50 loudly. Shortlist or split beyond that.
+  >50 loudly and points at `action=tournament`, which narrows a wide field
+  (up to 400 options) by elimination rounds.
 - **Max 20 questions per call** — one forward pass answers all of them.
+- **Memory bounds.** `batch` and `long` chunk their forward passes
+  (`batch_size=8` states/windows per pass): upstream defaults run every
+  state/window in a single pass, so peak RAM grew with the item count and
+  OOM-killed a 7 GB box (exit 137) on a 40 000-char multilingual scan.
+  Batch states are capped at 8 000 chars each (64 states max); `long`
+  states at 40 000 chars.
 - Keep the default `--model auto`: the Router detects script before the
   forward pass, so non-Latin input never silently hits the English
   checkpoint.
