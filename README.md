@@ -234,9 +234,15 @@ means the answer carried no usable confidence, which a boolean cannot express.
 - **High-cardinality choice degrades.** Options share a fixed token budget; `decide`
   rejects >50 labels loudly and points you at `action=tournament`, which narrows
   the field by elimination rounds (no embedder needed) before the final pass.
-- **Long-document scans are RAM-hungry.** A wide window set on a small box
-  exhausts RAM and the process is OOM-killed, so `long` caps the state at 40 000
-  chars; raise `max_len`/`window` only on a machine with headroom.
+- **Long-document scans are RAM-hungry if unchunked.** Upstream runs every
+  window in a single forward pass by default, so peak RAM grows with the
+  window count — a 40 000-char multilingual scan (27k tokens, ~72 windows
+  at sequence width 1024) OOM-killed a 7 GB box (exit 137). Both wrappers
+  now chunk `long` and `batch` at 8 states/windows per forward pass, which
+  keeps peak activation memory flat (verified: the same scan completes
+  under a 3.5 GB cap that killed the unchunked version), and `long` caps
+  the state at 40 000 chars; raise `max_len`/`window` only on a machine
+  with headroom.
 - **`typed-decisions` checkpoint is fine-tune-specific.** Base checkpoints are
   near-chance on its workflows zero-shot; use the English/multilingual checkpoints for
   general work and fine-tune before relying on the typed-decisions head.
@@ -311,7 +317,8 @@ muse/bin/laya              # thin CLI wrapper over the module
 muse/README.md             # Muse integration usage
 scripts/install_laya_env.sh # laya + CPU torch into ~/.hermes/laya-venv (durable)
 skills/laya-decisions/     # Hermes skill: actions, measurements, usage rules
-tests/test_laya_tool.py    # offline validation battery (no model download needed)
+tests/test_laya_tool.py    # offline validation battery, Hermes tool (no model needed)
+tests/test_laya_muse.py    # offline validation battery, Muse module (no model needed)
 tests/test_laya_live.py    # live inference battery (real model, every action)
 tests/test_privacy_sweep.py # scanner regression: redaction + tracked-files-only
 install.sh                 # plugin + skill installer (Hermes)
@@ -321,7 +328,8 @@ privacy_sweep.py           # pre-push identifier scan
 ## Testing
 
 ```bash
-python tests/test_laya_tool.py          # offline: validation, dispatch, guards (65 cases)
+python tests/test_laya_tool.py          # offline: validation, dispatch, guards (73 cases)
+python tests/test_laya_muse.py          # offline: Muse module validation + batch plumbing (73 cases)
 python tests/test_laya_live.py          # live: real model, every action
 python tests/test_laya_live.py --quick  # live, skipping the slow long/tournament cases
 ```
