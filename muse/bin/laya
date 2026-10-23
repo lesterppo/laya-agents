@@ -4,6 +4,8 @@
 Single call:
     laya --action guard --state "..."
     laya --action decide --state "..." --questions '{...}'
+    laya --action schema --state "..." --schema '{...}'
+    laya --action long --state "..." --questions '{...}'
     laya --action route --state "我被重複收了兩次費用"
     laya --action status
 
