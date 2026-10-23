@@ -3,7 +3,63 @@
 Repo: `lesterppo/laya-agents` (renamed from `hermes-laya` on GitHub).
 Local clone: `~/hermes-laya`, branch `master`.
 
-## Task
+## 2026-10-24 (Muse VM, 7.7 GB / 2 cores, no swap) — OOM fix + Muse parity
+
+Peter: the test on another Linux computer went OOM; continue development
+and testing on this VM. Done:
+
+### OOM root cause (measured, not guessed)
+
+Upstream `Agent.predict_batch(batch_size=None)` sends **every** state in
+one forward pass, and `Router.predict_long` does the same with **every**
+window (its `window_batch_cap` only chunks when a small window multiplied
+the count). Peak RAM therefore grows with the item count, not the item
+size. Checkpoint residency is the other half: english weights 804 MB /
+multilingual 615 MB (fp32), one checkpoint load + one predict peaked at
+2,826 MB RSS, both checkpoints resident + an english long scan at
+4,105 MB.
+
+Reproduction (pre-fix code, `systemd-run -p MemoryMax=3.5G`): a
+40 000-char Traditional-Chinese `long` scan — inside the tool's own cap —
+tokenised to 27,202 tokens / 71 windows (multilingual width 1024) and was
+**OOM-killed, exit 137**, exactly the reported failure. The same scan on
+the fixed code completes under the same cap: `ok, 71 windows, 384 s`.
+
+### Fixes
+
+- `plugin/laya_tool.py` + `muse/laya_muse.py`: `batch` and `long` now
+  always pass `batch_size=8` (`_FORWARD_BATCH`) to the router, so peak
+  activation memory is flat in the item count. `batch` also caps each
+  state at 8 000 chars (previously uncapped).
+- Plugin gained the Muse module's proxy fix at import time:
+  bracketed-IPv6 `no_proxy` (e.g. `[::1]`) crashes httpx inside
+  huggingface_hub (`Invalid port: ':1]'`) on first download — the
+  offline battery failed exactly this way on this VM before the fix —
+  plus `HF_HUB_DISABLE_XET=1` fallback.
+- **`muse/laya_muse.py` brought to full 0.4.14 parity** (the standing
+  follow-up below): it previously exposed only 8 of the 13 actions with
+  the old semantics. Now: `schema`, `batch`, `long`, `tournament`,
+  `detect` added; `min_confidence` / `max_len` / `task` / `lang` /
+  `window` / `stride` / `group_size` parameters; email `subject`/`sender`
+  via `laya.email_state()` (previously silently ignored); route reports
+  detection language/script; status reports pinned revisions; batch-mode
+  request objects pass every field through.
+
+### Tests (this VM)
+
+- `tests/test_laya_tool.py` — offline, **73/73** (was 65; +batch per-state
+  cap, proxy sanitize, stub-router chunking assertions).
+- `tests/test_laya_muse.py` — **new** offline battery for the Muse
+  module, **73/73**.
+- `tests/test_laya_live.py` — live, **56/56** (was 48; +multilingual long
+  scan — 15 windows, refund 0.9999 — and a 16-state chunked batch).
+  Whole-battery peak RSS 3,887 MB. Timings on this shared 2-core VM are
+  far slower than the Hermes box (decide cold 27.6 s, long 77.7 s) and
+  are not comparable; correctness values match the Hermes run exactly.
+- Muse module also live-verified directly (guard 1.0, Hindi 0.9818,
+  schema/email identical to the plugin's).
+
+## Task (previous session)
 
 1. Update the repo from upstream `NandhaKishorM/laya` (0.3.5 → **0.4.14**).
 2. Run live + deep tests.
@@ -104,8 +160,15 @@ python privacy_sweep.py
 
 ## Remaining / possible follow-ups
 
-- `muse/laya_muse.py` still targets the 0.3.x answer keys — it needs the same
-  0.4.14 treatment (probabilities / answer_confidence / legend) as the Hermes
-  tool, plus the new actions if the Muse side wants them.
+- ~~`muse/laya_muse.py` still targets the 0.3.x answer keys~~ — done
+  2026-10-24 (Muse VM session above): full 0.4.14 parity + its own
+  offline battery.
 - The runtime copy at `~/.hermes/plugins/hermes_local_tools/laya_tool.py` is
   synced to the repo version (md5-identical); restart the gateway to pick it up.
+  NOTE: after this session's plugin changes, the Hermes box must re-sync
+  its runtime copy from the repo (and its `~/.hermes/laya-venv` is the
+  install the plugin bootstraps from).
+- A single `decide` on the multilingual checkpoint still runs one
+  sequence up to width 1024 (or a caller's `max_len` override) — that
+  peak is inherent to one forward pass and cannot be chunked; on a
+  <4 GB box prefer `english` routing or a smaller `max_len`.
