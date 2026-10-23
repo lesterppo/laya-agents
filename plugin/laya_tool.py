@@ -20,6 +20,24 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+# --- runtime network fixes (must run before anything imports laya) ---
+# Some sandboxed/proxied environments ship a no_proxy/NO_PROXY with bracketed
+# IPv6 literals (e.g. "[::1]") that crash httpx inside huggingface_hub with
+# "Invalid port: ':1]'" on the first checkpoint download. Replace only a
+# value that looks broken; a clean value is left untouched. Same fix as the
+# Muse module (muse/laya_muse.py) — the plugin needs it too: a plain Linux
+# box behind such a proxy failed every live call this way (2026-10-24).
+def _sanitize_proxy_env() -> None:
+    for var in ("no_proxy", "NO_PROXY"):
+        val = os.environ.get(var, "")
+        if ("[" in val or "]" in val) and val.strip():
+            os.environ[var] = "localhost,127.0.0.1"
+
+
+_sanitize_proxy_env()
+# Plain-HTTP resume for checkpoint downloads when hf-xet stalls behind a proxy.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
 _QTYPES = ("choice", "score", "noul")
 _MODELS = ("auto", "english", "multilingual", "typed-decisions")
 _PRESETS = ("triage", "guard", "moderation", "routemodel", "email")
@@ -34,6 +52,15 @@ _STATE_CAP = 8000
 # is OOM-killed (exit 137), so the state budget here is deliberately modest.
 # Raise it only on a machine with headroom.
 _LONG_STATE_CAP = 40_000
+# States/windows per forward pass on the batch and long paths. Upstream
+# defaults are unbounded — predict_batch(batch_size=None) sends EVERY state
+# in one pass and predict_long does the same with every window — so peak RAM
+# grows with the item count instead of the item size: 37 english windows in
+# one pass peaked at the 2.8 GB checkpoint-load plateau on a 7.7 GB box, and
+# the same shape on the multilingual checkpoint (max_len 8192, ~16x the
+# sequence width) is what OOM-killed the test box. Chunking at 8 keeps peak
+# activation memory flat; total time is roughly unchanged.
+_FORWARD_BATCH = 8
 
 _ROUTER = None
 
@@ -411,7 +438,10 @@ def _action_batch(states: List[Any], questions: dict, kw: Dict[str, Any]) -> str
     # predict_batch takes routing hints per request, not per call.
     per_req = {k: v for k, v in kw.items()
                if k in ("model", "task", "lang", "max_len", "head_max_len")}
+    # batch_size bounds states per forward pass (see _FORWARD_BATCH): without
+    # it the router sends all _MAX_BATCH states in a single pass.
     call_kw = {k: v for k, v in kw.items() if k == "min_confidence"}
+    call_kw["batch_size"] = _FORWARD_BATCH
     reqs = []
     for s in states:
         r = {"state": s, "questions": questions}
@@ -446,12 +476,17 @@ def _action_long(state: Any, questions: dict, kw: Dict[str, Any],
         return _err(f"router init failed: {exc}")
     t0 = time.time()
     # predict_long takes routing hints + window/stride; it has no min_confidence.
+    # batch_size caps windows per forward pass (see _FORWARD_BATCH): upstream's
+    # window_batch_cap only chunks when a small window multiplied the count, so
+    # the default-window scan would otherwise run every window in one pass.
     ckw = {k: v for k, v in kw.items() if k in ("model", "task", "lang")}
     try:
-        if window or stride:
-            res = router.predict_long(state, questions, window=window, stride=stride, **ckw)
-        else:
-            res = router.predict_long(state, questions, **ckw)
+        wkw: Dict[str, Any] = {"batch_size": _FORWARD_BATCH}
+        if window:
+            wkw["window"] = window
+        if stride:
+            wkw["stride"] = stride
+        res = router.predict_long(state, questions, **wkw, **ckw)
     except Exception as exc:
         return _err(f"long predict failed: {str(exc)[:300]}")
     ms = int(1000 * (time.time() - t0))
@@ -541,6 +576,11 @@ def _handler(args: dict) -> str:
             return _err("states must be a non-empty JSON array")
         if len(states) > _MAX_BATCH:
             return _err(f"too many states ({len(states)} > {_MAX_BATCH})")
+        for s in states:
+            slen = len(s) if isinstance(s, str) else len(json.dumps(s, ensure_ascii=False))
+            if slen > _STATE_CAP:
+                return _err(f"batch state too long (>{_STATE_CAP} chars); "
+                            "pass the relevant excerpt per state")
         okq, qs, emsg = _parse_json(args.get("questions", ""), "questions")
         if not okq:
             return _err(emsg)
