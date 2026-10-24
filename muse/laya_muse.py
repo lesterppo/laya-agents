@@ -14,8 +14,8 @@ bounds below), adapted to how Muse invokes tools:
   (``--batch``) runs many requests through one warm process.
 
 Actions (parity with the Hermes tool, upstream laya 0.4.14): decide, schema,
-batch, long, tournament, detect, route, triage, guard, moderation,
-routemodel, email, status.
+schemabatch, batch, long, tournament, detect, route, triage, guard,
+moderation, routemodel, email, status.
 
 Memory bounds (the OOM fix, shared with the plugin): upstream
 ``predict_batch`` / ``predict_long`` default to ONE forward pass over every
@@ -248,7 +248,8 @@ def _compact_answers(answers: dict) -> dict:
 
 def _predict_kwargs(model: str, task: str = "", lang: str = "",
                     min_confidence: Optional[float] = None,
-                    max_len: Optional[int] = None) -> Dict[str, Any]:
+                    max_len: Optional[int] = None,
+                    head_max_len: Optional[int] = None) -> Dict[str, Any]:
     kw: Dict[str, Any] = {}
     if model and model != "auto":
         kw["model"] = model
@@ -260,6 +261,8 @@ def _predict_kwargs(model: str, task: str = "", lang: str = "",
         kw["min_confidence"] = min_confidence
     if max_len is not None:
         kw["max_len"] = max_len
+    if head_max_len is not None:
+        kw["head_max_len"] = head_max_len
     return kw
 
 
@@ -267,6 +270,18 @@ def _slim(a: dict) -> dict:
     """Fallback projection when a payload exceeds the inline cap."""
     return {k: {kk: v.get(kk) for kk in ("choice", "noul", "score", "confidence",
                                          "answer_confidence")}
+            for k, v in a.items() if isinstance(v, dict)}
+
+
+def _slim_values(a: dict) -> dict:
+    """Last-resort projection: the answer value only, no confidences.
+
+    A full batch (up to 64 states) still exceeds the inline cap after
+    _slim, because every item carries two confidence numbers per
+    question. Dropping those keeps the choices (and their order) while
+    fitting the cap; the payload is flagged with "compact": true.
+    """
+    return {k: {kk: v.get(kk) for kk in ("choice", "noul", "score") if kk in v}
             for k, v in a.items() if isinstance(v, dict)}
 
 
@@ -376,8 +391,9 @@ def _run_predict(state: Any, questions: dict, kw: Dict[str, Any]) -> dict:
     try:
         res = router.predict(state, questions, **kw)
     except TypeError:
-        # older laya without min_confidence / max_len
-        trimmed = {k: v for k, v in kw.items() if k not in ("min_confidence", "max_len")}
+        # older laya without min_confidence / max_len / head_max_len
+        trimmed = {k: v for k, v in kw.items()
+                   if k not in ("min_confidence", "max_len", "head_max_len")}
         try:
             res = router.predict(state, questions, **trimmed)
         except Exception as exc2:
@@ -425,6 +441,55 @@ def _action_schema(state: Any, schema: Any, kw: Dict[str, Any]) -> dict:
             "ms": ms}
 
 
+def _action_schemabatch(states: List[Any], schema: Any, kw: Dict[str, Any]) -> dict:
+    """One JSON Schema over many states (upstream Router.decide_batch).
+
+    The schema is planned once and its questions run over every state
+    through the batched path, in input order. Chunked like `batch`
+    (batch_size=_FORWARD_BATCH).
+    """
+    try:
+        router = _get_router()
+    except Exception as exc:
+        return {"ok": False, "e": f"router init failed: {exc}"}
+    t0 = time.time()
+    call_kw = {k: v for k, v in kw.items()
+               if k in ("model", "task", "lang", "max_len", "head_max_len")}
+    call_kw["batch_size"] = _FORWARD_BATCH
+    mc = kw.get("min_confidence")
+    try:
+        results = router.decide_batch(states, schema=schema, return_details=True,
+                                      min_confidence=mc, **call_kw)
+    except Exception as exc:
+        return {"ok": False, "e": f"schemabatch failed: {str(exc)[:300]}"}
+    ms = int(1000 * (time.time() - t0))
+    out = []
+    for res in results:
+        conf = getattr(res, "confidence", {}) or {}
+        aconf = getattr(res, "answer_confidence", {}) or {}
+        routing = getattr(res, "routing", {}) or {}
+        out.append({"v": getattr(res, "values", None),
+                    "c": {k: _round(v) for k, v in conf.items()},
+                    "ac": {k: _round(v) for k, v in aconf.items()},
+                    "m": routing.get("model")})
+    payload: dict = {"ok": True, "n": len(out), "batch": out, "ms": ms}
+    s = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    if len(s) > _INLINE_CAP:
+        for item in payload["batch"]:
+            item["c"] = {}
+            item["ac"] = {}
+        s = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        if len(s) > _INLINE_CAP:
+            for item in payload["batch"]:
+                item.pop("m", None)
+            payload["compact"] = True
+            s = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        if len(s) > _INLINE_CAP:
+            return {"ok": False,
+                    "e": f"schemabatch payload too large ({len(s)} chars); fewer states"}
+    return payload
+
+
 def _action_batch(states: List[Any], questions: dict, kw: Dict[str, Any]) -> dict:
     try:
         router = _get_router()
@@ -458,6 +523,11 @@ def _action_batch(states: List[Any], questions: dict, kw: Dict[str, Any]) -> dic
         for item in payload["batch"]:
             item["a"] = _slim(item["a"])
         s = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        if len(s) > _INLINE_CAP:
+            for item in payload["batch"]:
+                item["a"] = _slim_values(item["a"])
+            payload["compact"] = True
+            s = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
         if len(s) > _INLINE_CAP:
             return {"ok": False,
                     "e": f"batch payload too large ({len(s)} chars); fewer states or questions"}
@@ -545,6 +615,7 @@ def predict(action: str = "decide", state: Any = None,
             subject: str = "", sender: str = "",
             task: str = "", lang: str = "",
             min_confidence: Any = None, max_len: Any = None,
+            head_max_len: Any = None,
             window: Any = None, stride: Any = None,
             group_size: Any = 16) -> dict:
     """Run one decision. Returns the result dict (``ok``/``a``/``r``/``ms``).
@@ -564,7 +635,8 @@ def predict(action: str = "decide", state: Any = None,
     lang = str(lang or "")
     mc = _as_float(min_confidence, "min_confidence")
     ml = _as_int(max_len, "max_len")
-    kw = _predict_kwargs(model, task, lang, mc, ml)
+    hml = _as_int(head_max_len, "head_max_len")
+    kw = _predict_kwargs(model, task, lang, mc, ml, hml)
 
     if action == "status":
         return status()
@@ -587,6 +659,20 @@ def predict(action: str = "decide", state: Any = None,
         qs = _parse_json(questions, "questions")
         _validate_questions(qs)
         return _action_batch(states_v, qs, kw)
+
+    if action == "schemabatch":
+        states_v = _parse_json_any(states, "states")
+        if not isinstance(states_v, list) or not states_v:
+            raise LayaError("states must be a non-empty JSON array")
+        if len(states_v) > _MAX_BATCH:
+            raise LayaError(f"too many states ({len(states_v)} > {_MAX_BATCH})")
+        for s in states_v:
+            slen = len(s) if isinstance(s, str) else len(json.dumps(s, ensure_ascii=False))
+            if slen > _STATE_CAP:
+                raise LayaError(f"batch state too long (>{_STATE_CAP} chars); "
+                                "pass the relevant excerpt per state")
+        schema_v = _parse_json(schema, "schema")
+        return _action_schemabatch(states_v, schema_v, kw)
 
     st = _coerce_state(state if state is not None else text)
 
@@ -612,8 +698,9 @@ def predict(action: str = "decide", state: Any = None,
         return _action_tournament(st, qs, kw, gs)
 
     if action not in _PRESETS and action != "decide":
-        raise LayaError("unknown action '%s'; use decide|schema|batch|long|tournament|"
-                        "detect|route|triage|guard|moderation|routemodel|email|status" % action)
+        raise LayaError("unknown action '%s'; use decide|schema|schemabatch|batch|long|"
+                        "tournament|detect|route|triage|guard|moderation|routemodel|email|status"
+                        % action)
 
     if isinstance(st, str) and len(st) > _STATE_CAP:
         raise LayaError(f"state too long (>{_STATE_CAP} chars); pass the relevant excerpt")
@@ -662,6 +749,7 @@ def run_batch(requests: list) -> list:
                 lang=req.get("lang", "") or "",
                 min_confidence=req.get("min_confidence"),
                 max_len=req.get("max_len"),
+                head_max_len=req.get("head_max_len"),
                 window=req.get("window"),
                 stride=req.get("stride"),
                 group_size=req.get("group_size", 16)))
@@ -690,6 +778,7 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--lang", default="")
     ap.add_argument("--min-confidence", dest="min_confidence")
     ap.add_argument("--max-len", dest="max_len")
+    ap.add_argument("--head-max-len", dest="head_max_len")
     ap.add_argument("--window")
     ap.add_argument("--stride")
     ap.add_argument("--group-size", dest="group_size", default=16)
@@ -729,6 +818,7 @@ def main(argv: Optional[list] = None) -> int:
                     subject=ns.subject, sender=ns.sender,
                     task=ns.task, lang=ns.lang,
                     min_confidence=ns.min_confidence, max_len=ns.max_len,
+                    head_max_len=ns.head_max_len,
                     window=ns.window, stride=ns.stride, group_size=ns.group_size)
     except LayaError as exc:
         print(json.dumps({"ok": False, "e": str(exc)}, separators=(",", ":")))
