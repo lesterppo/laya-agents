@@ -282,6 +282,91 @@ check("batch-16 first is refund",
 TIMES["batch-16"] = d.get("_ms", 0)
 
 # ---------------------------------------------------------------------------
+print("\n== schemabatch (one schema over many states) ==")
+sb_states = ["Please refund invoice 1, you charged me twice",
+             "The server is down, we cannot log in",
+             "I was billed twice for March, refund the duplicate",
+             "Can I get a demo of the new plan?"]
+d = call({"action": "schemabatch", "states": q(sb_states), "schema": q(SCHEMA)})
+print(json.dumps(d, ensure_ascii=False)[:600])
+check("schemabatch ok", d.get("ok") is True, d.get("e"))
+sb = d.get("batch") or []
+check("schemabatch returned every state", d.get("n") == 4 and len(sb) == 4, d.get("n"))
+check("schemabatch order preserved, first is billing",
+      len(sb) == 4 and sb[0]["v"]["department"] == "billing"
+      and sb[1]["v"]["department"] != "billing", sb[0]["v"] if sb else None)
+TIMES["schemabatch"] = d.get("_ms", 0)
+
+# ---------------------------------------------------------------------------
+print("\n== batch-64 (max batch, chunked) ==")
+states64 = ([f"Please refund invoice {i}, charged twice" for i in range(32)]
+            + [f"The server is down, error {i}" for i in range(32)])
+d = call({"action": "batch", "states": q(states64),
+          "questions": q({"intent": {
+              "type": "choice",
+              "instructions": "What does the customer want in `message`?",
+              "criteria": {"refund": "money back", "technical": "bug or outage",
+                           "sales": "pricing or demo", "other": "none"}}})})
+print(json.dumps(d, ensure_ascii=False)[:400])
+check("batch-64 ok", d.get("ok") is True, d.get("e"))
+b64 = d.get("batch") or []
+check("batch-64 returned every state", d.get("n") == 64 and len(b64) == 64, d.get("n"))
+check("batch-64 first refund, 33rd technical",
+      len(b64) == 64 and b64[0]["a"]["intent"]["choice"] == "refund"
+      and b64[32]["a"]["intent"]["choice"] == "technical",
+      (b64[0]["a"]["intent"], b64[32]["a"]["intent"]) if len(b64) == 64 else None)
+check("batch-64 compact flag set (confidences dropped over the inline cap)",
+      d.get("compact") is True, d.get("compact"))
+TIMES["batch-64"] = d.get("_ms", 0)
+
+# ---------------------------------------------------------------------------
+print("\n== route: 0.4.14 function-word regression ==")
+# Upstream 0.4.14 (#1315): plain-English questions with only closed-class
+# words ("Why hasn't my card been delivered?") previously read as language
+# undecided and fell through to the multilingual default; the 82-word
+# English function list now routes them to the English checkpoint.
+d = call({"action": "route", "state": "Why hasn't my card been delivered?"})
+print(json.dumps(d, ensure_ascii=False)[:400])
+check("route 0.4.14 plain-English question ok", d.get("ok") is True, d.get("e"))
+check("route 0.4.14 plain-English question goes english",
+      d.get("m") == "english", d)
+TIMES["route-0414"] = d.get("_ms", 0)
+
+# ---------------------------------------------------------------------------
+print("\n== decide with max_len=8192 (deep, multilingual long input) ==")
+if not QUICK:
+    # Signal sits past the multilingual checkpoint's shipped 1024-token
+    # window (~1600 tokens in, but the whole doc stays under the tool's
+    # 8000-char state cap). The discriminating comparison is against the
+    # default budget on the SAME doc: at 1024 the signal is truncated
+    # away (noul 0.0, "t": true); at 8192 it is seen (noul rises, no
+    # truncation flag). The absolute value stays low because one refund
+    # sentence in 61 sentences is genuinely diluted in a whole-document
+    # decide — the `long` scan, not `decide`, is the tool for a buried
+    # signal (it found 1.0 at window 12 above).
+    filler = ("The quarterly report covers routine operations, staffing "
+              "schedules and inventory levels across all regional offices. ")
+    doc8192 = filler * 60 + "The customer was charged twice and demands an immediate refund."
+    qs8192 = q({"refund": {"type": "noul",
+                           "instructions": "Does the text request a refund?"}})
+    d_def = call({"action": "decide", "state": doc8192, "model": "multilingual",
+                  "questions": qs8192})
+    d = call({"action": "decide", "state": doc8192, "model": "multilingual",
+              "max_len": 8192, "questions": qs8192})
+    print("default:", json.dumps(d_def, ensure_ascii=False)[:300])
+    print("maxlen :", json.dumps(d, ensure_ascii=False)[:300])
+    check("max_len=8192 decide ok", d.get("ok") is True, d.get("e"))
+    check("max_len=8192 decide routed multilingual",
+          d.get("r", {}).get("m") == "multilingual", d.get("r"))
+    check("max_len=8192 decide is not truncated", d.get("t") is not True, d.get("t"))
+    check("default budget truncates the same doc", d_def.get("t") is True, d_def.get("t"))
+    check("max_len=8192 sees more of the late refund signal than default",
+          float(d.get("a", {}).get("refund", {}).get("noul", 0))
+          > float(d_def.get("a", {}).get("refund", {}).get("noul", 0)),
+          (d_def.get("a", {}).get("refund"), d.get("a", {}).get("refund")))
+    TIMES["maxlen-8192"] = d.get("_ms", 0)
+
+# ---------------------------------------------------------------------------
 print("\n== tournament (narrowing a wide choice) ==")
 if not QUICK:
     criteria = {f"label_{i}": f"category number {i}" for i in range(77)}
@@ -301,6 +386,26 @@ if not QUICK:
     check("tournament kept a small finalist set",
           len(meta.get("labels") or []) <= 16, meta.get("labels"))
     TIMES["tournament"] = d.get("_ms", 0)
+
+    # Deep: the documented maximum (400 options). Several elimination
+    # rounds; the true answer must survive to the finalist set.
+    criteria400 = {f"label_{i}": f"category number {i}" for i in range(398)}
+    criteria400["refund_request"] = "the customer asks for money back"
+    criteria400["cancel_plan"] = "the customer wants to cancel"
+    d = call({"action": "tournament",
+              "state": "I was charged twice and I want my money back, refund me",
+              "questions": q({"intent": {"type": "choice",
+                                          "instructions": "What does the customer want?",
+                                          "criteria": criteria400}}),
+              "group_size": 16})
+    print(json.dumps(d, ensure_ascii=False)[:1200])
+    check("tournament-400 ok", d.get("ok") is True, d.get("e"))
+    meta400 = (d.get("t") or {}).get("intent") or {}
+    check("tournament-400 narrowed 400 options", (meta400.get("n") or 0) == 400, meta400)
+    check("tournament-400 ran multiple rounds", (meta400.get("rounds") or 0) >= 2, meta400)
+    check("tournament-400 kept refund_request as finalist",
+          "refund_request" in (meta400.get("labels") or []), meta400.get("labels"))
+    TIMES["tournament-400"] = d.get("_ms", 0)
 
 # ---------------------------------------------------------------------------
 print("\n== report ==")
