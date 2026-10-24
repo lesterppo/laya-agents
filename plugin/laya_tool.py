@@ -57,9 +57,10 @@ _LONG_STATE_CAP = 40_000
 # in one pass and predict_long does the same with every window — so peak RAM
 # grows with the item count instead of the item size: 37 english windows in
 # one pass peaked at the 2.8 GB checkpoint-load plateau on a 7.7 GB box, and
-# the same shape on the multilingual checkpoint (max_len 8192, ~16x the
-# sequence width) is what OOM-killed the test box. Chunking at 8 keeps peak
-# activation memory flat; total time is roughly unchanged.
+# the same shape on the multilingual checkpoint (1024-token shipped
+# window, up to 8192 with a max_len override) is what OOM-killed the test
+# box. Chunking at 8 keeps peak activation memory flat; total time is
+# roughly unchanged.
 _FORWARD_BATCH = 8
 
 _ROUTER = None
@@ -266,7 +267,8 @@ def _compact_answers(answers: dict) -> dict:
 
 def _predict_kwargs(model: str, task: str = "", lang: str = "",
                     min_confidence: Optional[float] = None,
-                    max_len: Optional[int] = None) -> Dict[str, Any]:
+                    max_len: Optional[int] = None,
+                    head_max_len: Optional[int] = None) -> Dict[str, Any]:
     kw: Dict[str, Any] = {}
     if model and model != "auto":
         kw["model"] = model
@@ -278,6 +280,8 @@ def _predict_kwargs(model: str, task: str = "", lang: str = "",
         kw["min_confidence"] = min_confidence
     if max_len is not None:
         kw["max_len"] = max_len
+    if head_max_len is not None:
+        kw["head_max_len"] = head_max_len
     return kw
 
 
@@ -285,6 +289,18 @@ def _slim(a: dict) -> dict:
     """Fallback projection when a payload exceeds the inline cap."""
     return {k: {kk: v.get(kk) for kk in ("choice", "noul", "score", "confidence",
                                          "answer_confidence")}
+            for k, v in a.items() if isinstance(v, dict)}
+
+
+def _slim_values(a: dict) -> dict:
+    """Last-resort projection: the answer value only, no confidences.
+
+    A full batch (up to 64 states) still exceeds the inline cap after
+    _slim, because every item carries two confidence numbers per
+    question. Dropping those keeps the choices (and their order) while
+    fitting the cap; the payload is flagged with "compact": true.
+    """
+    return {k: {kk: v.get(kk) for kk in ("choice", "noul", "score") if kk in v}
             for k, v in a.items() if isinstance(v, dict)}
 
 
@@ -297,8 +313,9 @@ def _run_predict(state: Any, questions: dict, kw: Dict[str, Any]) -> str:
     try:
         res = router.predict(state, questions, **kw)
     except TypeError:
-        # older laya without min_confidence / max_len
-        trimmed = {k: v for k, v in kw.items() if k not in ("min_confidence", "max_len")}
+        # older laya without min_confidence / max_len / head_max_len
+        trimmed = {k: v for k, v in kw.items()
+                   if k not in ("min_confidence", "max_len", "head_max_len")}
         try:
             res = router.predict(state, questions, **trimmed)
         except Exception as exc2:
@@ -429,6 +446,57 @@ def _action_schema(state: Any, schema: Any, kw: Dict[str, Any]) -> str:
                 "ms": ms})
 
 
+def _action_schemabatch(states: List[Any], schema: Any, kw: Dict[str, Any]) -> str:
+    """One JSON Schema over many states (upstream Router.decide_batch).
+
+    The schema is planned once and its questions run over every state
+    through the batched path, in input order. Chunked like `batch`
+    (batch_size=_FORWARD_BATCH) — without it, decide_batch would send
+    all states in one forward pass.
+    """
+    try:
+        router = _get_router()
+    except Exception as exc:
+        return _err(f"router init failed: {exc}")
+    t0 = time.time()
+    # Routing pins / token budget ride on each request in decide_batch's
+    # Router convention; batch_size is the call-level chunking knob.
+    call_kw = {k: v for k, v in kw.items()
+               if k in ("model", "task", "lang", "max_len", "head_max_len")}
+    call_kw["batch_size"] = _FORWARD_BATCH
+    mc = kw.get("min_confidence")
+    try:
+        results = router.decide_batch(states, schema=schema, return_details=True,
+                                      min_confidence=mc, **call_kw)
+    except Exception as exc:
+        return _err(f"schemabatch failed: {str(exc)[:300]}")
+    ms = int(1000 * (time.time() - t0))
+    out = []
+    for res in results:
+        conf = getattr(res, "confidence", {}) or {}
+        aconf = getattr(res, "answer_confidence", {}) or {}
+        routing = getattr(res, "routing", {}) or {}
+        out.append({"v": getattr(res, "values", None),
+                    "c": {k: _round(v) for k, v in conf.items()},
+                    "ac": {k: _round(v) for k, v in aconf.items()},
+                    "m": routing.get("model")})
+    payload: dict = {"ok": True, "n": len(out), "batch": out, "ms": ms}
+    s = _ok(payload)
+    if len(s) > _INLINE_CAP:
+        for item in payload["batch"]:
+            item["c"] = {}
+            item["ac"] = {}
+        s = _ok(payload)
+        if len(s) > _INLINE_CAP:
+            for item in payload["batch"]:
+                item.pop("m", None)
+            payload["compact"] = True
+            s = _ok(payload)
+        if len(s) > _INLINE_CAP:
+            return _err(f"schemabatch payload too large ({len(s)} chars); fewer states")
+    return s
+
+
 def _action_batch(states: List[Any], questions: dict, kw: Dict[str, Any]) -> str:
     try:
         router = _get_router()
@@ -463,6 +531,13 @@ def _action_batch(states: List[Any], questions: dict, kw: Dict[str, Any]) -> str
         for item in payload["batch"]:
             item["a"] = _slim(item["a"])
         s = _ok(payload)
+        if len(s) > _INLINE_CAP:
+            # Full batches still exceed the cap after slimming: drop the
+            # confidences and keep the choices, flagged as compact.
+            for item in payload["batch"]:
+                item["a"] = _slim_values(item["a"])
+            payload["compact"] = True
+            s = _ok(payload)
         if len(s) > _INLINE_CAP:
             return _err(f"batch payload too large ({len(s)} chars); fewer states or questions")
     return s
@@ -546,6 +621,11 @@ def _handler(args: dict) -> str:
         max_len = int(max_len) if max_len is not None else None
     except Exception:
         return _err("max_len must be an integer")
+    head_max_len = args.get("head_max_len")
+    try:
+        head_max_len = int(head_max_len) if head_max_len is not None else None
+    except Exception:
+        return _err("head_max_len must be an integer")
 
     if action == "status":
         try:
@@ -587,7 +667,26 @@ def _handler(args: dict) -> str:
         okv, vmsg = _validate_questions(qs)
         if not okv:
             return _err(vmsg)
-        return _action_batch(states, qs, _predict_kwargs(model, task, lang, mc, max_len))
+        return _action_batch(states, qs, _predict_kwargs(model, task, lang, mc, max_len, head_max_len))
+
+    if action == "schemabatch":
+        ok, states, emsg = _parse_json_any(args.get("states"), "states")
+        if not ok:
+            return _err(emsg)
+        if not isinstance(states, list) or not states:
+            return _err("states must be a non-empty JSON array")
+        if len(states) > _MAX_BATCH:
+            return _err(f"too many states ({len(states)} > {_MAX_BATCH})")
+        for s in states:
+            slen = len(s) if isinstance(s, str) else len(json.dumps(s, ensure_ascii=False))
+            if slen > _STATE_CAP:
+                return _err(f"batch state too long (>{_STATE_CAP} chars); "
+                            "pass the relevant excerpt per state")
+        oks, schema, emsg = _parse_json(args.get("schema", ""), "schema")
+        if not oks:
+            return _err(emsg)
+        return _action_schemabatch(states, schema,
+                                   _predict_kwargs(model, task, lang, mc, max_len, head_max_len))
 
     ok, state, emsg = _state_arg(args)
     if not ok:
@@ -597,7 +696,7 @@ def _handler(args: dict) -> str:
         oks, schema, emsg = _parse_json(args.get("schema", ""), "schema")
         if not oks:
             return _err(emsg)
-        return _action_schema(state, schema, _predict_kwargs(model, task, lang, mc, max_len))
+        return _action_schema(state, schema, _predict_kwargs(model, task, lang, mc, max_len, head_max_len))
 
     if action == "long":
         okq, qs, emsg = _parse_json(args.get("questions", ""), "questions")
@@ -615,7 +714,7 @@ def _handler(args: dict) -> str:
             stride = int(stride) if stride is not None else None
         except Exception:
             return _err("window/stride must be integers")
-        return _action_long(state, qs, _predict_kwargs(model, task, lang, mc, max_len),
+        return _action_long(state, qs, _predict_kwargs(model, task, lang, mc, max_len, head_max_len),
                             window, stride)
 
     if action == "tournament":
@@ -632,7 +731,7 @@ def _handler(args: dict) -> str:
             return _err("group_size must be an integer")
         if group_size < 2:
             return _err("group_size must be >= 2")
-        return _action_tournament(state, qs, _predict_kwargs(model, task, lang, mc, max_len),
+        return _action_tournament(state, qs, _predict_kwargs(model, task, lang, mc, max_len, head_max_len),
                                   group_size)
 
     if action in _PRESETS or action == "decide":
@@ -645,7 +744,7 @@ def _handler(args: dict) -> str:
             okv, vmsg = _validate_questions(qs)
             if not okv:
                 return _err(vmsg)
-            return _run_predict(state, qs, _predict_kwargs(model, task, lang, mc, max_len))
+            return _run_predict(state, qs, _predict_kwargs(model, task, lang, mc, max_len, head_max_len))
         try:
             cats = None
             if args.get("categories"):
@@ -672,10 +771,10 @@ def _handler(args: dict) -> str:
                     return _err(f"email state failed: {exc}")
         else:
             st = _wrap_state(state, field)
-        return _run_predict(st, qs, _predict_kwargs(model, task, lang, mc, max_len))
+        return _run_predict(st, qs, _predict_kwargs(model, task, lang, mc, max_len, head_max_len))
 
-    return _err(f"unknown action '{action}'; use decide|schema|batch|long|tournament|"
-                "detect|route|triage|guard|moderation|routemodel|email|status")
+    return _err(f"unknown action '{action}'; use decide|schema|schemabatch|batch|long|"
+                "tournament|detect|route|triage|guard|moderation|routemodel|email|status")
 
 
 def _runner(args):
@@ -689,7 +788,8 @@ LAYA_SCHEMA: Dict[str, Any] = {
     "name": "laya",
     "description": "Fast typed decisions (choice/score/noul) in one forward pass, no"
     " hallucination. decide=text+questions JSON; schema=JSON-schema typed values;"
-    " batch=many states one pass; long=scan long docs; tournament=narrow >50 options;"
+    " schemabatch=one schema over many states; batch=many states one pass;"
+    " long=scan long docs; tournament=narrow >50 options;"
     " detect=language/script (no model load); route=which checkpoint;"
     " triage/guard/moderation/routemodel/email=preset schemas; status=health.",
     "parameters": {
@@ -697,8 +797,8 @@ LAYA_SCHEMA: Dict[str, Any] = {
         "properties": {
             "action": {
                 "type": "string",
-                "description": "decide (default), schema, batch, long, tournament, detect,"
-                " route, triage, guard, moderation, routemodel, email, status.",
+                "description": "decide (default), schema, schemabatch, batch, long, tournament,"
+                " detect, route, triage, guard, moderation, routemodel, email, status.",
             },
             "state": {
                 "type": "string",
@@ -716,12 +816,13 @@ LAYA_SCHEMA: Dict[str, Any] = {
             },
             "schema": {
                 "type": "string",
-                "description": "JSON Schema for action=schema; returns typed values"
+                "description": "JSON Schema for action=schema/schemabatch; returns typed values"
                 " (enum/integer level/boolean).",
             },
             "states": {
                 "type": "string",
-                "description": "JSON array of states for action=batch (one forward pass).",
+                "description": "JSON array of states for action=batch/schemabatch (chunked"
+                " forward passes, order preserved).",
             },
             "categories": {
                 "type": "string",
@@ -755,7 +856,12 @@ LAYA_SCHEMA: Dict[str, Any] = {
             },
             "max_len": {
                 "type": "integer",
-                "description": "Token budget override (multilingual reads up to 8192).",
+                "description": "Token budget override (multilingual accepts up to 8192;"
+                " its shipped limit is 1024). Not used by action=long.",
+            },
+            "head_max_len": {
+                "type": "integer",
+                "description": "Question-head token budget override. Not used by action=long.",
             },
             "window": {
                 "type": "integer",
