@@ -3,6 +3,83 @@
 Repo: `lesterppo/laya-agents` (renamed from `hermes-laya` on GitHub).
 Local clone: `~/hermes-laya`, branch `master`.
 
+## 2026-10-24 (afternoon, Muse VM) — upstream re-audit + schemabatch + deep test
+
+Peter: update the repo after reading the latest original laya repo, live
+and deep test before the final push. Audit result: **upstream is still
+0.4.14** — PyPI latest 0.4.14, upstream HEAD is the release commit
+`0a05a450` (2026-10-23), HF snapshot `convaiinnovations/laya`
+`7b928d82` unchanged (last modified 2026-10-03). Nothing to upgrade; the
+venv (`uv pip install laya==0.4.14`) reports already satisfied. The audit
+did find one real gap against the 0.4.14 API surface, and the deep test
+found one real product bug:
+
+### New: `schemabatch` action (both wrappers)
+
+Upstream `Router.decide_batch` — one JSON Schema over many states, the
+schema planned once — had no wrapper action (only single-state `schema`
+and question-based `batch` existed). Added as action `schemabatch`
+(14 actions total): states array (≤64, per-state ≤8000 chars), schema,
+chunked `batch_size=8` like `batch` (decide_batch otherwise sends all
+states in one forward pass), routing pins / token budget per request,
+`min_confidence` gate, per-item `v`/`c`/`ac`/`m`, order preserved.
+`head_max_len` is now also exposed on decide/schema/batch/schemabatch
+(it was accepted by `batch` per-request but never reachable as a call
+parameter); `long` deliberately excludes it and `max_len` (upstream
+`predict_long` takes neither).
+
+### Deep-test finding: full batches could not return at all
+
+A 64-state batch slimmed to ~7,986 chars still exceeds the 6,000-char
+inline cap, so `batch` errored on its own documented maximum. Fix (both
+wrappers): a third projection pass drops per-question confidences and
+keeps the answer values, flagged `"compact": true` in the payload.
+`schemabatch` got the same treatment (confidences, then the model tag).
+Shape is unchanged, so callers reading `choice`/`noul`/`score` are
+unaffected; only confidence fields disappear on compact payloads.
+
+### New live cases (and what they prove)
+
+- `schemabatch` (4 states): typed values, order preserved.
+- `batch-64` (max batch): all 64 returned, first refund / 33rd technical,
+  `compact: true` — the regression guard for the fix above.
+- `route` 0.4.14 regression (#1315): "Why hasn't my card been delivered?"
+  now routes `english` (previously language-undecided → multilingual
+  default, before upstream's 82-word English function list).
+- `decide` with `model=multilingual, max_len=8192`: signal at ~1,600
+  tokens — past the shipped 1024-token window. Discriminating
+  comparison on the same doc: default budget truncates it away
+  (noul 0.0, `"t": true`); at 8192 it is seen (noul 0.103, no
+  truncation flag). The absolute value stays low because one refund
+  sentence in 61 is genuinely diluted in a whole-document decide —
+  the `long` scan is the right tool for a buried signal, and it found
+  1.0 at window 12. An earlier draft of this case asserted noul > 0.5
+  and failed at 0.103; the probe above showed the override works and
+  the threshold was the wrong premise, so the case now asserts the
+  relative comparison instead of hiding the number.
+- `tournament-400` (documented maximum): 2 elimination rounds,
+  `refund_request` survives to a 2-label finalist set.
+
+### Deliberately NOT exposed (upstream 0.4.14 surface, out of scope)
+
+`predict_shortlist` (needs a caller-supplied embedder; `tournament` is
+the embedder-free narrowing path), `FastLaya` (TileLang GPU extra, not
+installed on a CPU box), prediction hooks / calibration fitting
+(`fit_temperatures`, `calibrate_reliability`), and the framework
+integrations (`LayaRouter`, `LayaGuardrail`, `LayaTriage`,
+`LayaEvaluator`, LangChain/CrewAI/LlamaIndex) — framework features, not
+tool actions. Re-audit this list if the tool's scope changes.
+
+### Tests (this VM)
+
+- `tests/test_laya_tool.py` — offline, **79/79** (was 73; +schemabatch
+  stub cases, `_slim_values`, unknown-action text).
+- `tests/test_laya_muse.py` — offline, **78/78** (was 73; same additions).
+- `tests/test_laya_live.py` — live, **74/74** (was 56).
+  Whole-battery peak RSS 3,862 MB.
+- Muse module also live-verified directly (schemabatch, route-0.4.14,
+  head_max_len smoke) via the scratch script.
+
 ## 2026-10-24 (Muse VM, 7.7 GB / 2 cores, no swap) — OOM fix + Muse parity
 
 Peter: the test on another Linux computer went OOM; continue development
