@@ -193,6 +193,7 @@ class _StubRouter:
     def __init__(self):
         self.batch_kw: dict = {}
         self.long_kw: dict = {}
+        self.schemabatch_kw: dict = {}
 
     def route(self, state, questions):
         return {"model": "english", "repo": "stub", "reason": "stub",
@@ -215,6 +216,16 @@ class _StubRouter:
 
         return R()
 
+    def decide_batch(self, states, schema=None, return_details=False,
+                     min_confidence=None, **kw):
+        self.schemabatch_kw = kw
+        class R:
+            values = {"department": "billing", "urgency": 2, "needs_human": False}
+            confidence = {"department": 0.9}
+            answer_confidence = {"department": 0.95}
+            routing = {"model": "english"}
+        return [R() for _ in states]
+
 
 _stub = _StubRouter()
 _saved_router = lm._ROUTER
@@ -234,6 +245,30 @@ try:
     d = lm.predict("schema", state="hello", schema=_q({"type": "object"}))
     check("schema (stub) returns typed values",
           d.get("ok") is True and d.get("v", {}).get("department") == "billing", d)
+    d = lm.predict("schemabatch", states=_q(["refund invoice", "server down"]),
+                   schema=_q({"type": "object", "properties": {
+                       "department": {"type": "string", "enum": ["billing", "support"]}}}))
+    check("schemabatch (stub) ok",
+          d.get("ok") is True and d.get("n") == 2
+          and d["batch"][0]["v"]["department"] == "billing", d)
+    check("schemabatch passes batch_size=_FORWARD_BATCH",
+          _stub.schemabatch_kw.get("batch_size") == lm._FORWARD_BATCH,
+          _stub.schemabatch_kw)
+    try:
+        lm.predict("schemabatch", states=_q(["x" * 9000]),
+                   schema=_q({"type": "object", "properties": {}}))
+        check("schemabatch rejects per-state >8000 chars", False, "no error raised")
+    except lm.LayaError as exc:
+        check("schemabatch rejects per-state >8000 chars", True, str(exc))
+    check("_slim_values keeps only the answer value",
+          lm._slim_values({"x": {"choice": "a", "confidence": 0.9,
+                                 "answer_confidence": 0.8, "p": {"a": 0.9}}})
+          == {"x": {"choice": "a"}})
+    try:
+        lm.predict("bogus", state="x")
+        check("unknown action lists schemabatch", False, "no error raised")
+    except lm.LayaError as exc:
+        check("unknown action lists schemabatch", "schemabatch" in str(exc), str(exc))
     d = lm.predict("tournament", state="hello",
                    questions=_q({"x": {"type": "choice", "instructions": "hi",
                                        "criteria": {f"o{i}": None for i in range(77)}}}))
