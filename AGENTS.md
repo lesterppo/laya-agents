@@ -27,7 +27,8 @@ what the LLM is for. Laya is the cheap first pass, not an answer generator.
 |---|---|
 | `decide` | answers to your own questions: `choice` (label + probabilities + confidence), `score` (ordinal + distribution), `noul` (calibrated P(true)) |
 | `schema` | typed values from a JSON Schema: enum → label, bounded int → level, bool → bool, plus per-field confidence |
-| `batch` | many states in one forward pass, input order preserved |
+| `schemabatch` | one JSON Schema over many states (upstream `Router.decide_batch`), chunked, order preserved |
+| `batch` | many states in chunked forward passes (8 per pass), input order preserved |
 | `long` | windowed scan of a long document, with the deciding window index |
 | `tournament` | a wide choice (>50 options) narrowed by elimination rounds |
 | `detect` | language + script, with the reason. **No model load** — sub-ms |
