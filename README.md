@@ -52,7 +52,8 @@ An LLM classification call costs 500–2000+ tokens. The same judgment here is
 |---|---|
 | `decide` | state + your own typed questions (`choice`/`score`/`noul`) |
 | `schema` | a JSON Schema in, typed values out (enum → label, bounded int → level, bool) |
-| `batch` | many states, **one** forward pass — order preserved |
+| `schemabatch` | one JSON Schema over many states, chunked passes, order preserved |
+| `batch` | many states, chunked forward passes (8 per pass) — order preserved |
 | `long` | windowed scan of a long document; reports the deciding window |
 | `tournament` | narrows a wide choice (>50 options) by elimination rounds |
 | `detect` | language + script detection — **no model load**, sub-ms |
@@ -328,16 +329,17 @@ privacy_sweep.py           # pre-push identifier scan
 ## Testing
 
 ```bash
-python tests/test_laya_tool.py          # offline: validation, dispatch, guards (73 cases)
-python tests/test_laya_muse.py          # offline: Muse module validation + batch plumbing (73 cases)
+python tests/test_laya_tool.py          # offline: validation, dispatch, guards (79 cases)
+python tests/test_laya_muse.py          # offline: Muse module validation + batch plumbing (78 cases)
 python tests/test_laya_live.py          # live: real model, every action
 python tests/test_laya_live.py --quick  # live, skipping the slow long/tournament cases
 ```
 
 The offline battery exercises validation and guard paths only. The live battery
 runs the real checkpoints: every action, both checkpoints, multilingual routing,
-the confidence gate, schema-driven decisions, batch, long-document scanning and
-tournament narrowing.
+the confidence gate, schema-driven decisions, schemabatch, batch (up to 64),
+long-document scanning (including a max_len=8192 long-input case) and
+tournament narrowing (up to 400 options).
 
 ## License
 
