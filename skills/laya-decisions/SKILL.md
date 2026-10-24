@@ -1,7 +1,7 @@
 ---
 name: laya-decisions
 description: Use for fast typed text decisions without an LLM call.
-version: 2.1.0
+version: 2.2.0
 author: Peter (lesterppo)
 license: MIT
 metadata:
@@ -29,9 +29,10 @@ Targets upstream laya **0.4.14**.
 
 - `decide` — state/text + `questions` JSON (each: type choice|score|noul +
   instructions + criteria). `model` defaults to `auto` (Router picks).
+- `schemabatch` — one JSON Schema over many states (upstream `decide_batch`), chunked passes, order preserved.
 - `schema` — a JSON Schema in, typed values out: enum → label, bounded int →
   level, boolean → bool, with per-field confidence.
-- `batch` — many states, ONE forward pass, input order preserved.
+- `batch` — many states, chunked forward passes (8 per pass), input order preserved.
 - `long` — windowed scan of a long document; reports the deciding window index.
 - `tournament` — narrows a wide choice (>50 options) by elimination rounds.
 - `detect` — language + script, NO model load (sub-ms).
@@ -103,7 +104,7 @@ to `sys.path`. If `import laya` fails, run that script and restart the gateway.
 ## Tests
 
 ```bash
-python tests/test_laya_tool.py   # offline: 73 cases, no model needed
-python tests/test_laya_muse.py   # offline: 73 cases (Muse module), no model needed
+python tests/test_laya_tool.py   # offline: 79 cases, no model needed
+python tests/test_laya_muse.py   # offline: 78 cases (Muse module), no model needed
 python tests/test_laya_live.py   # live: real model, every action
 ```
