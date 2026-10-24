@@ -76,7 +76,7 @@ failures come back as `{"ok": False, "e": ...}` so batch runs survive them.
 
 ## Actions
 
-All thirteen actions of the Hermes plugin: `decide`, `schema`, `batch`,
+All fourteen actions of the Hermes plugin: `decide`, `schema`, `schemabatch`, `batch`,
 `long`, `tournament`, `detect`, `route`, `triage`, `guard`, `moderation`,
 `routemodel`, `email`, `status`. See the repo root README for what each
 returns. Extra parameters mirror the plugin too: `schema`, `states`,
