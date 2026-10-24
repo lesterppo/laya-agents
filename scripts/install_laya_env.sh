@@ -17,6 +17,8 @@
 set -euo pipefail
 
 VENV="${LAYA_VENV:-$HOME/.hermes/laya-venv}"
+# laya 0.4.14 is the latest upstream release as of 2026-10-24 (PyPI
+# latest == upstream HEAD 0a05a450, release v0.4.14, 2026-10-23).
 LAYA_VERSION="${LAYA_VERSION:-0.4.14}"
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cpu}"
 
