@@ -241,6 +241,7 @@ class _StubRouter:
     def __init__(self):
         self.batch_kw: dict = {}
         self.long_kw: dict = {}
+        self.schemabatch_kw: dict = {}
 
     def predict_batch(self, reqs, **kw):
         self.batch_kw = kw
@@ -250,6 +251,16 @@ class _StubRouter:
         self.long_kw = kw
         return {"answers": {}, "routing": {"model": "english"},
                 "usage": {"windows": 3}}
+
+    def decide_batch(self, states, schema=None, return_details=False,
+                     min_confidence=None, **kw):
+        self.schemabatch_kw = kw
+        class _R:
+            values = {"department": "billing", "urgency": 2, "needs_human": False}
+            confidence = {"department": 0.9}
+            answer_confidence = {"department": 0.95}
+            routing = {"model": "english"}
+        return [_R() for _ in states]
 
 
 _stub = _StubRouter()
@@ -265,6 +276,29 @@ try:
     check("long (stub) ok", d.get("ok") is True and d.get("win") == 3, d.get("e"))
     check("long passes batch_size=_FORWARD_BATCH",
           _stub.long_kw.get("batch_size") == t._FORWARD_BATCH, _stub.long_kw)
+    d = call({"action": "schemabatch",
+              "states": _q(["refund invoice", "server down"]),
+              "schema": _q({"type": "object", "properties": {
+                  "department": {"type": "string", "enum": ["billing", "support"]}}})})
+    check("schemabatch (stub) ok",
+          d.get("ok") is True and d.get("n") == 2
+          and d["batch"][0]["v"]["department"] == "billing", d.get("e"))
+    check("schemabatch passes batch_size=_FORWARD_BATCH",
+          _stub.schemabatch_kw.get("batch_size") == t._FORWARD_BATCH,
+          _stub.schemabatch_kw)
+    d = call({"action": "schemabatch", "states": _q(["x" * 9000]),
+              "schema": _q({"type": "object", "properties": {}})})
+    check("schemabatch rejects per-state >8000 chars", d.get("ok") is False, d.get("e"))
+    d = call({"action": "schemabatch", "states": _q(["a"]),
+              "schema": "not json"})
+    check("schemabatch rejects bad schema JSON", d.get("ok") is False, d.get("e"))
+    check("_slim_values keeps only the answer value",
+          t._slim_values({"x": {"choice": "a", "confidence": 0.9,
+                                "answer_confidence": 0.8, "p": {"a": 0.9}}})
+          == {"x": {"choice": "a"}})
+    d = call({"action": "bogus", "state": "x"})
+    check("unknown action lists schemabatch",
+          d.get("ok") is False and "schemabatch" in (d.get("e") or ""), d.get("e"))
 finally:
     t._ROUTER = _saved_router
 
